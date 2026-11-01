@@ -1,0 +1,3241 @@
+---
+title: "HAB_final"
+author: "K. Grond"
+date: "2026-11-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(123)
+```
+
+```{r Load libraries, include=FALSE}
+library(qiime2R)
+library(ggplot2)
+library(phyloseq)
+library(dplyr)
+library(tidyverse)
+library(vegan)
+library(picante)
+library(rstatix)
+library(ALDEx2)
+library(pwalign)
+library(dada2)
+library(ggh4x)
+library(Biostrings)
+library(ggtext)
+library(annotate)
+```
+
+# Data Import & Preparation
+
+## Data Preparation: All Eukaryotes
+```{r Import QIIME2 Output}
+# 1. Import QIIME 2 artifacts into a phyloseq object (feature table, tree, taxonomy, metadata)
+ps <- qza_to_phyloseq(
+  features = "Qiime2_output/table.qza", 
+  tree     = "Qiime2_output/rooted-tree.qza", 
+  taxonomy = "Qiime2_output/taxonomy.qza", 
+  metadata = "Qiime2_output/metadata.txt"
+)
+
+# 2. Load representative ASV sequences from the QIIME 2 artifact
+all_seqs <- read_qza("Qiime2_output/rep-seqs.qza")$data
+
+# 3. Convert sequences to Biostrings DNAStringSet format for phyloseq compatibility
+dna_seqs <- DNAStringSet(all_seqs)
+
+# 4. Subset and align sequences to match active taxa names in the phyloseq object
+dna_seqs_matched <- dna_seqs[taxa_names(ps)]
+
+# 5. Merge representative sequences into the phyloseq object (populates the refseq slot)
+ps <- merge_phyloseq(ps, dna_seqs_matched)
+```
+
+```{r Replace taxonomy with PR2 taxonomy}
+# 1. Import raw tab-separated taxonomy output from QIIME 2
+tax_raw <- read.delim("Qiime2_output/taxonomy.tsv", sep = "\t", stringsAsFactors = FALSE)
+
+# 2. Parse PR2 taxonomy strings into 9 ranks, remove rank prefixes (e.g., 'g__'), trim whitespace, and set empty values to NA
+tax_cleaned <- tax_raw %>%
+  separate(
+    Taxon, 
+    into = c("Kingdom", "Supergroup", "Division", "Subdivision", 
+             "Class", "Order", "Family", "Genus", "Species"), 
+    sep = ";", 
+    fill = "right"
+  ) %>%
+  mutate(across(Kingdom:Species, ~str_remove_all(., "^[[:lower:]]+_+"))) %>%
+  mutate(across(Kingdom:Species, ~str_trim(.))) %>%
+  mutate(across(Kingdom:Species, ~na_if(., "")))
+
+# 3. Extract cleaned taxonomic ranks into a matrix format
+tax_mat <- tax_cleaned %>%
+  dplyr::select(Kingdom:Species) %>%
+  as.matrix()
+
+# 4. Assign ASV/Feature IDs as row names and attach cleaned taxonomy matrix to the phyloseq object
+rownames(tax_mat) <- tax_cleaned$Feature.ID
+tax_table(ps) <- tax_table(tax_mat)
+
+# 5. Extract sample metadata from the phyloseq object into a standalone data frame
+metadata <- data.frame(sample_data(ps))
+
+# Extract total read counts per sample into a data frame
+read_counts <- data.frame(
+  SampleID = sample_names(ps),
+  ReadCount = sample_sums(ps)
+)
+```
+
+```{r Remove Controls}
+# 1. Filter out control samples from the phyloseq object
+ps_clean <- subset_samples(ps, type != "control")
+
+# 2. Prune taxa with zero total abundance across remaining samples
+ps_clean <- prune_taxa(taxa_sums(ps_clean) > 0, ps_clean)
+
+# 3. Extract updated metadata for the cleaned sample dataset
+metadata_clean <- data.frame(sample_data(ps_clean))
+```
+
+```{r Rarefy full phyloseq}
+# Set seed for reproducible subsampling
+set.seed(123)
+
+# ------------------------------------------------------------------------------
+# 1. Rarefaction Curve Generation
+# ------------------------------------------------------------------------------
+# Ensure output directory exists
+dir.create("figures", showWarnings = FALSE, recursive = TRUE)
+
+# Export rarefaction curve as high-resolution PNG
+png("figures/Rarefaction_Curve.png", width = 2400, height = 1800, res = 300)
+
+otu_tab_clean <- as(otu_table(ps_clean), "matrix")
+if (taxa_are_rows(ps_clean)) { otu_tab_clean <- t(otu_tab_clean) }
+
+rarecurve(
+  otu_tab_clean, 
+  step = 50, 
+  col = "blue", 
+  label = FALSE, 
+  main = "Rarefaction Curve",
+  xlab = "Read Count",
+  ylab = "No. ASVs",
+  xlim = c(0, 10000)
+)
+abline(v = 8593, col = "red", lty = 2) # Threshold line for subsampling depth
+dev.off()
+
+# ------------------------------------------------------------------------------
+# 2. Rarefy / Subsample Dataset
+# ------------------------------------------------------------------------------
+# Subsample phyloseq object to even depth (8,593 reads/sample) and remove orphaned taxa
+ps_rarefied <- rarefy_even_depth(
+  ps_clean, 
+  sample.size = 8593, 
+  replace = FALSE, 
+  rngseed = 123
+)
+ps_rarefied <- prune_taxa(taxa_sums(ps_rarefied) > 0, ps_rarefied)
+print(ps_rarefied)
+
+# ------------------------------------------------------------------------------
+# 3. Good's Coverage Calculation
+# ------------------------------------------------------------------------------
+# Format OTU table for sample-wise coverage estimation [Coverage = 1 - (Singletons / Total Reads)]
+otu_tab_rare <- as.data.frame(otu_table(ps_rarefied))
+if (!taxa_are_rows(ps_rarefied)) { otu_tab_rare <- t(otu_tab_rare) }
+
+goods_results <- apply(otu_tab_rare, 2, function(x) {
+  x <- x[x > 0]
+  1 - (sum(x == 1) / sum(x))
+})
+
+goods_df <- data.frame(
+  SampleID = names(goods_results),
+  GoodsCoverage = as.numeric(goods_results)
+)
+
+# Output summary metrics and evaluate against 95% threshold
+cat("Average Good's Coverage:", round(mean(goods_df$GoodsCoverage), 4), "\n")
+print(range(goods_df$GoodsCoverage))
+
+if (all(goods_df$GoodsCoverage > 0.95)) {
+  cat("Success: All samples have Good's Coverage > 0.95.\n")
+} else {
+  failed_samples <- goods_df[goods_df$GoodsCoverage <= 0.95, ]
+  cat("Warning:", nrow(failed_samples), "samples failed the 0.95 threshold.\n")
+  print(failed_samples)
+}
+
+# Export Good's coverage statistics to CSV files
+dir.create("statistics", showWarnings = FALSE, recursive = TRUE)
+write.csv(goods_df, "statistics/Goods_Coverage.csv", row.names = FALSE)
+```
+
+## Data Preparation: Algae only
+```{r Create algae phyloseq}
+# ------------------------------------------------------------------------------
+# 1. Define Taxonomic Inclusion & Exclusion Criteria
+# ------------------------------------------------------------------------------
+algae_include <- c("TSAR", "Archaeplastida", "Haptista", "Cryptista",
+                   "Stramenopile", "Chlorophyta", "Bacillario", "Dinophyceae",
+                   "Mediophyceae", "Coscinodiscophyceae", "Ochrophyta", "Skeletonema", 
+                   "Thalassionema", "Thalassiosira")
+
+algae_exclude <- c("Ciliophora", "Intramacronucleata", "Rhizaria", "Retaria",
+                   "Metazoa", "Opisthokonta")
+
+# Collapse vectors into unified regular expressions for fast vectorized matching
+inc_pattern <- paste(algae_include, collapse = "|")
+exc_pattern <- paste(algae_exclude, collapse = "|")
+
+# ------------------------------------------------------------------------------
+# 2. Extract Taxonomy & Concatenate Ranks
+# ------------------------------------------------------------------------------
+tax_df <- as.data.frame(as(tax_table(ps_clean), "matrix"))
+tax_strings <- apply(tax_df, 1, paste, collapse = " ")
+
+# ------------------------------------------------------------------------------
+# 3. Vectorized Taxa Filtering
+# ------------------------------------------------------------------------------
+# Match inclusion/exclusion patterns across full taxonomy strings
+include_idx <- grepl(inc_pattern, tax_strings, ignore.case = TRUE)
+exclude_idx <- grepl(exc_pattern, tax_strings, ignore.case = TRUE)
+
+# Retain target algal taxa while strictly excluding non-algal/heterotrophic clades
+final_algae_idx <- include_idx & !exclude_idx
+
+# ------------------------------------------------------------------------------
+# 4. Subset Phyloseq Object & Prune Empty Features/Samples
+# ------------------------------------------------------------------------------
+ps_algae <- prune_taxa(final_algae_idx, ps_clean) %>%
+  prune_taxa(taxa_sums(.) > 0, .) %>%
+  prune_samples(sample_sums(.) > 0, .)
+
+# ------------------------------------------------------------------------------
+# 5. Validation Check & Metadata Extraction
+# ------------------------------------------------------------------------------
+# Verify zero excluded taxa remain in filtered dataset
+check_strings <- apply(as.data.frame(as(tax_table(ps_algae), "matrix")), 1, paste, collapse = " ")
+n_bad_taxa <- sum(grepl(exc_pattern, check_strings, ignore.case = TRUE))
+cat("Validation Check — Number of remaining excluded taxa:", n_bad_taxa, "\n")
+
+# Extract sample metadata for the filtered algal phyloseq object
+metadata_algae <- data.frame(sample_data(ps_algae))
+
+read_counts <- data.frame(
+  SampleID = sample_names(ps_algae),
+  ReadCount = sample_sums(ps_algae)
+)
+```
+
+```{r Rarefy algae phyloseq}
+# Set seed for reproducibility
+set.seed(123)
+
+# ------------------------------------------------------------------------------
+# 1. Algal Rarefaction Curve
+# ------------------------------------------------------------------------------
+# Ensure output directory exists
+dir.create("figures", showWarnings = FALSE, recursive = TRUE)
+
+# Export high-resolution rarefaction plot
+png("figures/Algal_Rarefaction_Curve.png", width = 3400, height = 1800, res = 300)
+
+otu_tab_algae <- as(otu_table(ps_algae), "matrix")
+if (taxa_are_rows(ps_algae)) { otu_tab_algae <- t(otu_tab_algae) }
+
+rarecurve(
+  otu_tab_algae, 
+  step = 50, 
+  col = "blue", 
+  label = FALSE, 
+  main = "Algal Rarefaction Curve",
+  xlab = "Read Count",
+  ylab = "No. ASVs",
+  xlim = c(0, 10000)
+)
+abline(v = 2603, col = "red", lty = 2) # Depth threshold line (2,603 reads)
+dev.off()
+
+# ------------------------------------------------------------------------------
+# 2. Rarefy / Subsample Algal Dataset
+# ------------------------------------------------------------------------------
+# Subsample algal phyloseq object to even depth and prune zero-abundance features
+ps_algae_rarefied <- rarefy_even_depth(
+  ps_algae, 
+  sample.size = 2603, 
+  replace = FALSE, 
+  rngseed = 123
+)
+ps_algae_rarefied <- prune_taxa(taxa_sums(ps_algae_rarefied) > 0, ps_algae_rarefied)
+print(ps_algae_rarefied)
+
+# ------------------------------------------------------------------------------
+# 3. Good's Coverage Calculation
+# ------------------------------------------------------------------------------
+# Calculate sample-wise Good's Coverage [Coverage = 1 - (Singletons / Total Reads)]
+otu_tab_rare <- as.data.frame(otu_table(ps_algae))
+if (!taxa_are_rows(ps_algae)) { otu_tab_rare <- t(otu_tab_rare) }
+
+goods_results <- apply(otu_tab_rare, 2, function(x) {
+  x <- x[x > 0]
+  1 - (sum(x == 1) / sum(x))
+})
+
+goods_df <- data.frame(
+  SampleID = names(goods_results),
+  GoodsCoverage = as.numeric(goods_results)
+)
+
+# Print summary metrics and evaluate against 0.95 quality threshold
+cat("Average Good's Coverage:", round(mean(goods_df$GoodsCoverage), 4), "\n")
+print(range(goods_df$GoodsCoverage))
+
+if (all(goods_df$GoodsCoverage > 0.95)) {
+  cat("Success: All samples have Good's Coverage > 0.95.\n")
+} else {
+  failed_samples <- goods_df[goods_df$GoodsCoverage <= 0.95, ]
+  cat("Warning:", nrow(failed_samples), "samples failed the 0.95 threshold.\n")
+  print(failed_samples)
+}
+
+# Export results to CSV
+dir.create("statistics", showWarnings = FALSE, recursive = TRUE)
+write.csv(goods_df, "statistics/Algae_Goods_Coverage.csv", row.names = FALSE)
+```
+
+## Data Preparation: HAB taxa only
+```{r Create HAB phyloseq}
+# ------------------------------------------------------------------------------
+# 1. Define Target HAB (Harmful Algal Bloom) Taxa
+# ------------------------------------------------------------------------------
+hab_include <- c(
+  "Alexandr", "Pseudo-nitz", "Pseudonitz", "Dinophysis", "Heterosigma", 
+  "Margalefidinium", "Chaetoceros", "Phaeocystis", "Gonyaul", "Phaeocystal", 
+  "Chaetocerotal", "Dinophysial", "Gymnodinial", "Peridinial", "Suessial"
+)
+hab_regex <- paste(hab_include, collapse = "|")
+
+# ------------------------------------------------------------------------------
+# 2. Identify and Subset HAB ASVs
+# ------------------------------------------------------------------------------
+# Filter taxonomy matrix across all ranks for target HAB keywords
+tax_df <- as.data.frame(as(tax_table(ps_algae_rarefied), "matrix"))
+hab_asvs <- tax_df %>%
+  filter(if_any(everything(), ~ grepl(hab_regex, .x, ignore.case = TRUE))) %>%
+  rownames()
+
+# Subset rarefied phyloseq object to HAB taxa and remove zero-abundance samples
+ps_HAB <- prune_taxa(hab_asvs, ps_algae_rarefied) %>%
+  prune_samples(sample_sums(.) > 0, .)
+
+metadata_HAB <- data.frame(sample_data(ps_HAB))
+
+# ------------------------------------------------------------------------------
+# 3. Relative Abundance Transformation & Sample Subsetting
+# ------------------------------------------------------------------------------
+# Transform HAB counts to compositional relative abundance (0–1 scale)
+ps_HAB_RelAbund <- transform_sample_counts(ps_HAB, function(x) x / sum(x))
+
+# Subset HAB dataset to active environmental samples
+ps_HAB_active <- subset_samples(ps_HAB, type == "active")
+```
+
+## Summary Statistics all Eukaryotes, algae & HAB taxa
+```{r Summary Statistics}
+# ------------------------------------------------------------------------------
+# 1. Sequencing Depth Metrics
+# ------------------------------------------------------------------------------
+# Compute summary statistics for sample read counts prior to rarefaction
+read_depths <- sample_sums(ps_clean)
+summary(read_depths)[c("Min.", "Mean", "Median", "Max.")]
+
+# ------------------------------------------------------------------------------
+# 2. Feature (ASV) Richness Summary
+# ------------------------------------------------------------------------------
+# Extract total ASV counts across full, algal, and HAB-filtered rarefied datasets
+asv_counts <- c(
+  all_asvs   = ntaxa(ps_rarefied),
+  algae_asvs = ntaxa(ps_algae_rarefied),
+  HAB_asvs   = ntaxa(ps_HAB)
+)
+print(asv_counts)
+
+# ------------------------------------------------------------------------------
+# 3. Taxonomic (Genus-Level) Richness Summary
+# ------------------------------------------------------------------------------
+# Helper function to count unique, non-NA genus assignments
+count_unique_genera <- function(ps_obj) {
+  length(na.omit(unique(as.character(tax_table(ps_obj)[, "Genus"]))))
+}
+
+# Calculate distinct genus counts across datasets
+genus_counts <- c(
+  all_genera   = count_unique_genera(ps_rarefied),
+  algae_genera = count_unique_genera(ps_algae_rarefied),
+  HAB_genera   = count_unique_genera(ps_HAB)
+)
+print(genus_counts)
+```
+
+
+
+##### Main Manuscript Figures #####
+# Figure 1: Alpha Diversity
+## Alpha Diversity Algae 
+```{r Alpha Diversity Plot}
+# ------------------------------------------------------------------------------
+# 1. Calculate Alpha Diversity & Phylogenetic Diversity (Faith's PD)
+# ------------------------------------------------------------------------------
+# Estimate standard alpha diversity metrics
+richness_algae <- estimate_richness(
+  ps_algae_rarefied, 
+  measures = c("Observed", "Chao1", "Shannon", "InvSimpson")
+)
+
+# Format OTU table for Faith's Phylogenetic Diversity calculation (samples as rows)
+otu_mat <- as(otu_table(ps_algae_rarefied), "matrix")
+if (taxa_are_rows(ps_algae_rarefied)) {
+  otu_mat <- t(otu_mat)
+}
+
+# Calculate Faith's PD using phyloseq phylogenetic tree
+pd_out <- pd(otu_mat, phy_tree(ps_algae_rarefied), include.root = FALSE)
+
+# Append Faith's PD and sample metadata to richness data frame
+richness_algae$FaithsPD <- pd_out$PD
+richness_algae <- cbind(richness_algae, sample_data(ps_algae_rarefied))
+
+# ------------------------------------------------------------------------------
+# 2. Data Reshaping & Factor Level Ordering
+# ------------------------------------------------------------------------------
+# Set chronological order for sampling months
+richness_algae$month <- factor(
+  richness_algae$month, 
+  levels = c("March", "April", "May", "June", "July", "August", "September", "October")
+)
+
+# Reshape data into long format for facet visualization
+richness_long <- richness_algae %>%
+  pivot_longer(
+    cols = c("Observed", "Shannon", "InvSimpson", "FaithsPD"), 
+    names_to = "Metric", 
+    values_to = "Value"
+  )
+
+# Set panel ordering for plot facets
+richness_long$Metric <- factor(
+  richness_long$Metric, 
+  levels = c("Observed", "Shannon", "InvSimpson", "FaithsPD")
+)
+
+# ------------------------------------------------------------------------------
+# 3. Visualization & File Export
+# ------------------------------------------------------------------------------
+# Generate faceted boxplot with jittered sample points
+alpha_diversity_algae <- ggplot(richness_long, aes(x = month, y = Value, fill = type)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.8)) +
+  geom_jitter(
+    position = position_jitterdodge(jitter.width = 0.1, dodge.width = 0.8), 
+    size = 1.2, 
+    alpha = 0.5
+  ) +
+  facet_wrap(~Metric, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = c("active" = "#56B4E9", "passive" = "#E69F00")) +
+  theme_bw() +
+  theme(
+    strip.background = element_rect(fill = "white"),
+    strip.text       = element_text(face = "bold", size = 13),
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 12),
+    axis.text.y      = element_text(size = 12),
+    axis.title       = element_text(size = 14),
+    legend.position  = "bottom", 
+    legend.text      = element_text(size = 13),
+    legend.title     = element_text(size = 14),
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(size = 15, face = "bold")
+  ) +
+  labs(x = "Month", y = "Index Value", fill = "Sample Type") +
+  ggtitle("Algae")
+
+# Display plot
+alpha_diversity_algae
+
+# Export figure with directory verification
+dir.create("figures", showWarnings = FALSE, recursive = TRUE)
+ggsave("figures/Algae_Alpha_Diversity_plot.png", alpha_diversity_algae, width = 8, height = 6, dpi = 300)
+```
+
+```{r Alpha Diversity Statistics: Temporal}
+# ------------------------------------------------------------------------------
+# 1. Data Subsetting & Variable Formatting
+# ------------------------------------------------------------------------------
+# Convert metadata factors and subset dataset for targeted statistical comparisons
+richness_algae$month <- as.factor(richness_algae$month)
+richness_algae$replicate <- as.factor(richness_algae$replicate)
+
+active_only <- subset(richness_algae, type == "active")
+
+# ------------------------------------------------------------------------------
+# 2. Non-Parametric Temporal Analysis Across Alpha Diversity Metrics
+# ------------------------------------------------------------------------------
+# Define alpha diversity metrics to iterate through
+indices <- c("Observed", "Shannon", "InvSimpson", "FaithsPD")
+
+# Initialize output lists for test statistics
+kw_list <- list()
+dunn_list <- list()
+
+# Run Kruskal-Wallis and Dunn's post-hoc tests (BH p-adjust) across metrics
+for (metric in indices) {
+  
+  formula_str <- as.formula(paste(metric, "~ month"))
+  
+  # 1. Kruskal-Wallis Test
+  res_kw <- active_only %>% kruskal_test(formula_str)
+  res_kw$Metric <- metric
+  kw_list[[metric]] <- res_kw
+  
+  # 2. Dunn's Post-Hoc Test (Benjamini-Hochberg FDR correction)
+  res_dunn <- active_only %>% dunn_test(formula_str, p.adjust.method = "BH")
+  res_dunn$Metric <- metric
+  dunn_list[[metric]] <- res_dunn
+}
+
+# ------------------------------------------------------------------------------
+# 3. Data Reorganization & Table Formatting
+# ------------------------------------------------------------------------------
+# Combine results across metrics into single data frames
+combined_kw <- do.call(rbind, kw_list)
+combined_dunn <- do.call(rbind, dunn_list)
+
+# Reorder columns to position Metric as the primary column
+combined_kw <- combined_kw[, c("Metric", setdiff(names(combined_kw), "Metric"))]
+combined_dunn <- combined_dunn[, c("Metric", setdiff(names(combined_dunn), "Metric"))]
+
+# ------------------------------------------------------------------------------
+# 4. Export Statistical Tables
+# ------------------------------------------------------------------------------
+dir.create("statistics", showWarnings = FALSE, recursive = TRUE)
+
+write.csv(combined_kw, "statistics/Algae_Alpha_Diversity_Temporal_KW.csv", row.names = FALSE)
+write.csv(combined_dunn, "statistics/Algae_Alpha_Diversity_Temporal_Dunn.csv", row.names = FALSE)
+```
+
+```{r Alpha Diversity Statistics: Sampling Method}
+# ------------------------------------------------------------------------------
+# 1. Subset Data & Create Interaction Factor (Active vs. Passive in July & August)
+# ------------------------------------------------------------------------------
+# Subset dataset to include only July and August samples
+july_august <- subset(richness_algae, month %in% c("July", "August"))
+
+# Combine sample type and month into a unified interaction factor for group-wise comparisons
+july_august$group <- factor(paste(july_august$type, july_august$month, sep = "_"))
+
+# ------------------------------------------------------------------------------
+# 2. Non-Parametric Group Analysis Across Alpha Diversity Metrics
+# ------------------------------------------------------------------------------
+# Define diversity metrics to iterate through
+indices <- c("Observed", "Shannon", "InvSimpson", "FaithsPD")
+
+# Initialize output lists for test statistics
+kw_list <- list()
+dunn_list <- list()
+
+# Run Kruskal-Wallis and Dunn's post-hoc tests (BH p-adjust) across metrics
+for (metric in indices) {
+  
+  formula_str <- as.formula(paste(metric, "~ group"))
+  
+  # 1. Kruskal-Wallis Test
+  res_kw <- july_august %>% kruskal_test(formula_str)
+  res_kw$Metric <- metric
+  kw_list[[metric]] <- res_kw
+  
+  # 2. Dunn's Post-Hoc Test (Benjamini-Hochberg FDR correction)
+  res_dunn <- july_august %>% dunn_test(formula_str, p.adjust.method = "BH")
+  res_dunn$Metric <- metric
+  dunn_list[[metric]] <- res_dunn
+}
+
+# ------------------------------------------------------------------------------
+# 3. Data Reorganization & Table Formatting
+# ------------------------------------------------------------------------------
+# Combine results across metrics into single data frames
+combined_kw <- do.call(rbind, kw_list)
+combined_dunn <- do.call(rbind, dunn_list)
+
+# Reorder columns to position Metric as the primary column
+combined_kw <- combined_kw[, c("Metric", setdiff(names(combined_kw), "Metric"))]
+combined_dunn <- combined_dunn[, c("Metric", setdiff(names(combined_dunn), "Metric"))]
+
+# ------------------------------------------------------------------------------
+# 4. Export Statistical Tables
+# ------------------------------------------------------------------------------
+dir.create("statistics", showWarnings = FALSE, recursive = TRUE)
+
+write.csv(combined_kw, "statistics/Algae_Alpha_Diversity_Method_KW.csv", row.names = FALSE)
+write.csv(combined_dunn, "statistics/Algae_Alpha_Diversity_Method_Dunn.csv", row.names = FALSE)
+```
+
+## Alpha Diversity HAB taxa
+
+```{r Alpha Diversity Plot: Temporal + Sampling Method}
+# ------------------------------------------------------------------------------
+# 1. Calculate Alpha Diversity & Phylogenetic Diversity (Faith's PD)
+# ------------------------------------------------------------------------------
+# Estimate standard alpha diversity metrics
+richness_HAB <- estimate_richness(
+  ps_HAB, 
+  measures = c("Observed", "Chao1", "Shannon", "InvSimpson")
+)
+
+# Format OTU table for Faith's Phylogenetic Diversity calculation (samples as rows)
+otu_mat <- as(otu_table(ps_HAB), "matrix")
+if (taxa_are_rows(ps_HAB)) {
+  otu_mat <- t(otu_mat)
+}
+
+# Calculate Faith's PD using phyloseq phylogenetic tree
+pd_out <- pd(otu_mat, phy_tree(ps_HAB), include.root = FALSE)
+
+# Append Faith's PD and sample metadata to richness data frame
+richness_HAB$FaithsPD <- pd_out$PD
+richness_HAB <- cbind(richness_HAB, sample_data(ps_HAB))
+
+# ------------------------------------------------------------------------------
+# 2. Data Reshaping & Factor Level Ordering
+# ------------------------------------------------------------------------------
+# Set chronological order for sampling months
+richness_HAB$month <- factor(
+  richness_HAB$month, 
+  levels = c("March", "April", "May", "June", "July", "August", "September", "October")
+)
+
+# Reshape data into long format for facet visualization
+richness_long <- richness_HAB %>%
+  pivot_longer(
+    cols = c("Observed", "Shannon", "InvSimpson", "FaithsPD"), 
+    names_to = "Metric", 
+    values_to = "Value"
+  )
+
+# Set panel ordering for plot facets
+richness_long$Metric <- factor(
+  richness_long$Metric, 
+  levels = c("Observed", "Shannon", "InvSimpson", "FaithsPD")
+)
+
+# ------------------------------------------------------------------------------
+# 3. Visualization & File Export
+# ------------------------------------------------------------------------------
+# Generate faceted boxplot with jittered sample points
+alpha_diversity_HAB <- ggplot(richness_long, aes(x = month, y = Value, fill = type)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.8)) +
+  geom_jitter(
+    position = position_jitterdodge(jitter.width = 0.1, dodge.width = 0.8), 
+    size = 1.2, 
+    alpha = 0.5
+  ) +
+  facet_wrap(~Metric, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = c("active" = "#56B4E9", "passive" = "#E69F00")) +
+  theme_bw() +
+  theme(
+    strip.background = element_rect(fill = "white"),
+    strip.text       = element_text(face = "bold", size = 13),
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 12),
+    axis.text.y      = element_text(size = 12),
+    axis.title       = element_text(size = 14),
+    legend.position  = "bottom", 
+    legend.text      = element_text(size = 13),
+    legend.title     = element_text(size = 14),
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(size = 15, face = "bold")
+  ) +
+  labs(x = "Month", y = "Index Value", fill = "Sample Type") +
+  ggtitle("HAB-containing Taxa")
+
+# Display plot
+alpha_diversity_HAB
+
+# Export figure with directory verification
+dir.create("figures", showWarnings = FALSE, recursive = TRUE)
+ggsave("figures/HAB_Alpha_Diversity_plot.png", alpha_diversity_HAB, width = 8, height = 6, dpi = 300)
+```
+
+```{r Alpha Diversity Statistics: Temporal Dynamics}
+# ------------------------------------------------------------------------------
+# 1. Data Subsetting & Variable Formatting
+# ------------------------------------------------------------------------------
+# Convert metadata factors and subset dataset for targeted statistical comparisons
+richness_HAB$month <- as.factor(richness_HAB$month)
+richness_HAB$replicate <- as.factor(richness_HAB$replicate)
+
+active_only <- subset(richness_HAB, type == "active")
+# ------------------------------------------------------------------------------
+# 2. Non-Parametric Temporal Analysis Across Alpha Diversity Metrics
+# ------------------------------------------------------------------------------
+# Define alpha diversity metrics to iterate through
+indices <- c("Observed", "Shannon", "InvSimpson", "FaithsPD")
+
+# Initialize output lists for test statistics
+kw_list <- list()
+dunn_list <- list()
+
+# Run Kruskal-Wallis and Dunn's post-hoc tests (BH p-adjust) across metrics
+for (metric in indices) {
+  
+  formula_str <- as.formula(paste(metric, "~ month"))
+  
+  # 1. Kruskal-Wallis Test
+  res_kw <- active_only %>% kruskal_test(formula_str)
+  res_kw$Metric <- metric
+  kw_list[[metric]] <- res_kw
+  
+  # 2. Dunn's Post-Hoc Test (Benjamini-Hochberg FDR correction)
+  res_dunn <- active_only %>% dunn_test(formula_str, p.adjust.method = "BH")
+  res_dunn$Metric <- metric
+  dunn_list[[metric]] <- res_dunn
+}
+
+# ------------------------------------------------------------------------------
+# 3. Data Reorganization & Table Formatting
+# ------------------------------------------------------------------------------
+# Combine results across metrics into single data frames
+combined_kw <- do.call(rbind, kw_list)
+combined_dunn <- do.call(rbind, dunn_list)
+
+# Reorder columns to position Metric as the primary column
+combined_kw <- combined_kw[, c("Metric", setdiff(names(combined_kw), "Metric"))]
+combined_dunn <- combined_dunn[, c("Metric", setdiff(names(combined_dunn), "Metric"))]
+
+# ------------------------------------------------------------------------------
+# 4. Export Statistical Tables
+# ------------------------------------------------------------------------------
+dir.create("statistics", showWarnings = FALSE, recursive = TRUE)
+
+write.csv(combined_kw, "statistics/HAB_Alpha_Diversity_Temporal_KW.csv", row.names = FALSE)
+write.csv(combined_dunn, "statistics/HAB_Alpha_Diversity_Temporal_Dunn.csv", row.names = FALSE)
+```
+
+```{r Alpha Diversity Statistics: Sampling Method}
+# ------------------------------------------------------------------------------
+# 1. Subset Data & Create Interaction Factor (Active vs. Passive in July & August)
+# ------------------------------------------------------------------------------
+# Subset dataset to include only July and August samples
+july_august <- subset(richness_HAB, month %in% c("July", "August"))
+
+# Combine sample type and month into a unified interaction factor for group-wise comparisons
+july_august$group <- factor(paste(july_august$type, july_august$month, sep = "_"))
+
+# ------------------------------------------------------------------------------
+# 2. Non-Parametric Group Analysis Across Alpha Diversity Metrics
+# ------------------------------------------------------------------------------
+# Define diversity metrics to iterate through
+indices <- c("Observed", "Shannon", "InvSimpson", "FaithsPD")
+
+# Initialize output lists for test statistics
+kw_list <- list()
+dunn_list <- list()
+
+# Run Kruskal-Wallis and Dunn's post-hoc tests (BH p-adjust) across metrics
+for (metric in indices) {
+  
+  formula_str <- as.formula(paste(metric, "~ group"))
+  
+  # 1. Kruskal-Wallis Test
+  res_kw <- july_august %>% kruskal_test(formula_str)
+  res_kw$Metric <- metric
+  kw_list[[metric]] <- res_kw
+  
+  # 2. Dunn's Post-Hoc Test (Benjamini-Hochberg FDR correction)
+  res_dunn <- july_august %>% dunn_test(formula_str, p.adjust.method = "BH")
+  res_dunn$Metric <- metric
+  dunn_list[[metric]] <- res_dunn
+}
+
+# ------------------------------------------------------------------------------
+# 3. Data Reorganization & Table Formatting
+# ------------------------------------------------------------------------------
+# Combine results across metrics into single data frames
+combined_kw <- do.call(rbind, kw_list)
+combined_dunn <- do.call(rbind, dunn_list)
+
+# Reorder columns to position Metric as the primary column
+combined_kw <- combined_kw[, c("Metric", setdiff(names(combined_kw), "Metric"))]
+combined_dunn <- combined_dunn[, c("Metric", setdiff(names(combined_dunn), "Metric"))]
+
+# ------------------------------------------------------------------------------
+# 4. Export Statistical Tables
+# ------------------------------------------------------------------------------
+dir.create("statistics", showWarnings = FALSE, recursive = TRUE)
+
+write.csv(combined_kw, "statistics/HAB_Alpha_Diversity_Method_KW.csv", row.names = FALSE)
+write.csv(combined_dunn, "statistics/HAB_Alpha_Diversity_Method_Dunn.csv", row.names = FALSE)
+```
+
+## Table 1A: Kruskal-Wallis: Temporal
+```{r Algae & HAB Taxa: Temporal}
+# ------------------------------------------------------------------------------
+# 1. Define Phyloseq Target List & Diversity Metrics
+# ------------------------------------------------------------------------------
+# Map dataset subsets to descriptive names for manuscript publication
+# (Add "All Eukaryotes" = ps_rarefied here if you want the full clean dataset included)
+ps_list <- list(
+  "Algal Taxa" = ps_algae_rarefied,
+  "HAB Taxa"   = ps_HAB
+)
+
+indices <- c("Observed", "Shannon", "InvSimpson", "FaithsPD")
+all_subsets_list <- list()
+
+# ------------------------------------------------------------------------------
+# 2. Iterate Across Datasets & Compute Temporal Non-Parametric Statistics
+# ------------------------------------------------------------------------------
+for (sub_name in names(ps_list)) {
+  ps_sub <- ps_list[[sub_name]]
+  
+  # Calculate standard alpha diversity indices
+  alpha_df <- estimate_richness(ps_sub, measures = c("Observed", "Shannon", "InvSimpson"))
+  
+  # Calculate Faith's PD if phylogenetic tree exists, else assign NA
+  if (!is.null(phy_tree(ps_sub, errorIfNULL = FALSE))) {
+    otu_mat <- as(otu_table(ps_sub), "matrix")
+    if (taxa_are_rows(ps_sub)) { otu_mat <- t(otu_mat) }
+    pd_res <- pd(otu_mat, phy_tree(ps_sub), include.root = FALSE)
+    alpha_df$FaithsPD <- pd_res$PD
+  } else {
+    alpha_df$FaithsPD <- NA
+  }
+  
+  # Merge metadata with calculated alpha diversity metrics
+  df_combined <- cbind(data.frame(sample_data(ps_sub)), alpha_df)
+  
+  # Run Kruskal-Wallis test across sampling months for each metric
+  kw_metrics <- list()
+  for (metric in indices) {
+    if (all(is.na(df_combined[[metric]]))) next
+    
+    res <- df_combined %>%
+      kruskal_test(as.formula(paste(metric, "~ month"))) %>%
+      mutate(Metric = metric) %>%
+      select(Metric, n, df, statistic, p)
+    
+    kw_metrics[[metric]] <- res
+  }
+  
+  # Combine metric results and pivot into wide format per subset
+  wide_kw <- bind_rows(kw_metrics) %>%
+    pivot_wider(
+      id_cols = c(n, df),
+      names_from = Metric,
+      values_from = c(statistic, p),
+      names_glue = "{Metric}_{.value}"
+    ) %>%
+    mutate(Subset = sub_name)
+  
+  # Ensure target columns exist even if FaithsPD was skipped
+  for (m in indices) {
+    if (!paste0(m, "_statistic") %in% names(wide_kw)) wide_kw[[paste0(m, "_statistic")]] <- NA_real_
+    if (!paste0(m, "_p") %in% names(wide_kw)) wide_kw[[paste0(m, "_p")]] <- NA_real_
+  }
+  
+  all_subsets_list[[sub_name]] <- wide_kw
+}
+
+# ------------------------------------------------------------------------------
+# 3. Format & Export Final Manuscript Table (Table 1A)
+# ------------------------------------------------------------------------------
+# Combine subsets and reorder columns for publication layout
+final_kw_table <- bind_rows(all_subsets_list) %>%
+  select(
+    Subset,
+    N = n,
+    df,
+    `Observed H`          = Observed_statistic,
+    `Observed p`          = Observed_p,
+    `Shannon H`           = Shannon_statistic,
+    `Shannon p`           = Shannon_p,
+    `Inverse Simpson H`   = InvSimpson_statistic,
+    `Inverse Simpson p`   = InvSimpson_p,
+    `Faith's PD H`        = FaithsPD_statistic,
+    `Faith's PD p`        = FaithsPD_p
+  )
+
+# Display summary table in console
+print(final_kw_table)
+
+# Export statistical summary to CSV
+dir.create("statistics", showWarnings = FALSE, recursive = TRUE)
+write.csv(
+  final_kw_table, 
+  "statistics/Table_1A.csv", 
+  row.names = FALSE
+)
+```
+
+## Table 1B: Significant Dunn's test: Temporal
+```{r Algae & HAB Taxa: Temporal}
+# ------------------------------------------------------------------------------
+# 1. Define Phyloseq Target List & Diversity Metrics
+# ------------------------------------------------------------------------------
+# Map dataset subsets to descriptive names for manuscript publication
+ps_list <- list(
+  "Algal Taxa" = ps_algae_rarefied,
+  "HAB"        = ps_HAB
+)
+
+indices <- c("Observed", "Shannon", "InvSimpson", "FaithsPD")
+all_subsets_list <- list()
+
+# ------------------------------------------------------------------------------
+# 2. Iterate Across Datasets & Compute Pairwise Dunn's Post-Hoc Tests
+# ------------------------------------------------------------------------------
+for (sub_name in names(ps_list)) {
+  # Use ps_sub to avoid overwriting global raw unrarefied ps object
+  ps_sub <- ps_list[[sub_name]]
+  
+  # Calculate standard alpha diversity indices
+  alpha_df <- estimate_richness(ps_sub, measures = c("Observed", "Shannon", "InvSimpson"))
+  
+  # Calculate Faith's PD if phylogenetic tree exists, else assign NA
+  if (!is.null(phy_tree(ps_sub, errorIfNULL = FALSE))) {
+    otu_mat <- as(otu_table(ps_sub), "matrix")
+    if (taxa_are_rows(ps_sub)) { otu_mat <- t(otu_mat) }
+    pd_res <- pd(otu_mat, phy_tree(ps_sub), include.root = FALSE)
+    alpha_df$FaithsPD <- pd_res$PD
+  } else {
+    alpha_df$FaithsPD <- NA
+  }
+  
+  # Merge metadata with calculated alpha diversity metrics
+  df_combined <- cbind(data.frame(sample_data(ps_sub)), alpha_df)
+  
+  # Run Dunn's test (BH p-value adjustment) across months for each metric
+  dunn_metrics <- list()
+  for (metric in indices) {
+    if (all(is.na(df_combined[[metric]]))) next
+    
+    res <- df_combined %>%
+      dunn_test(as.formula(paste(metric, "~ month")), p.adjust.method = "BH") %>%
+      mutate(
+        Contrast = paste(group1, "vs", group2),
+        Metric   = metric
+      ) %>%
+      select(Contrast, Metric, statistic, p.adj)
+    
+    dunn_metrics[[metric]] <- res
+  }
+  
+  # Combine metric results and pivot into wide format per subset
+  wide_dunn <- bind_rows(dunn_metrics) %>%
+    pivot_wider(
+      names_from  = Metric,
+      values_from = c(statistic, p.adj),
+      names_glue  = "{Metric}_{.value}"
+    )
+  
+  # Ensure target columns exist even if FaithsPD was skipped
+  for (m in indices) {
+    if (!paste0(m, "_statistic") %in% names(wide_dunn)) wide_dunn[[paste0(m, "_statistic")]] <- NA
+    if (!paste0(m, "_p.adj") %in% names(wide_dunn)) wide_dunn[[paste0(m, "_p.adj")]] <- NA
+  }
+  
+  # Filter contrasts where at least one metric is statistically significant (p.adj < 0.05)
+  sig_dunn <- wide_dunn %>%
+    filter(
+      (Observed_p.adj < 0.05 & !is.na(Observed_p.adj)) | 
+      (Shannon_p.adj < 0.05 & !is.na(Shannon_p.adj)) | 
+      (InvSimpson_p.adj < 0.05 & !is.na(InvSimpson_p.adj)) | 
+      (FaithsPD_p.adj < 0.05 & !is.na(FaithsPD_p.adj))
+    ) %>%
+    mutate(Subset = sub_name)
+  
+  all_subsets_list[[sub_name]] <- sig_dunn
+}
+
+# ------------------------------------------------------------------------------
+# 3. Format & Export Final Manuscript Table (Table 1B)
+# ------------------------------------------------------------------------------
+# Combine subsets and reorder columns for publication layout
+final_dunn_table <- bind_rows(all_subsets_list) %>%
+  select(
+    Subset,
+    Contrast,
+    `Observed estimate`          = Observed_statistic,
+    `Observed Adjusted p`        = Observed_p.adj,
+    `Shannon estimate`           = Shannon_statistic,
+    `Shannon Adjusted p`         = Shannon_p.adj,
+    `Inverse Simpson estimate`   = InvSimpson_statistic,
+    `Inverse Simpson Adjusted p` = InvSimpson_p.adj,
+    `Faith's PD estimate`        = FaithsPD_statistic,
+    `Faith's PD Adjusted p`      = FaithsPD_p.adj
+  )
+
+# Inspect head of summary table
+head(final_dunn_table)
+
+# Export statistical summary to CSV
+dir.create("statistics", showWarnings = FALSE, recursive = TRUE)
+write.csv(
+  final_dunn_table, 
+  "statistics/Table_1B.csv", 
+  row.names = FALSE
+)
+```
+
+## Table S2: Kruskal-Wallis: Sampling Method
+```{r Algae & HAB Taxa: Sampling Method}
+# ------------------------------------------------------------------------------
+# 1. Define Phyloseq Target List & Diversity Metrics
+# ------------------------------------------------------------------------------
+# Map dataset subsets to descriptive names for manuscript publication
+ps_list <- list(
+  "Algal Taxa" = ps_algae_rarefied,
+  "HAB Taxa"   = ps_HAB
+)
+
+indices <- c("Observed", "Shannon", "InvSimpson", "FaithsPD")
+
+# ------------------------------------------------------------------------------
+# 2. Iterate Across Subsets & Test Sampling Method Differences (July & August)
+# ------------------------------------------------------------------------------
+# Compute Kruskal-Wallis tests comparing sampling types (active vs. passive) in July & August
+raw_kw_sampling <- map_dfr(names(ps_list), function(sub_name) {
+  
+  # Subset to peak bloom months (July/August) and assign to ps_sub to protect workspace
+  ps_sub <- subset_samples(ps_list[[sub_name]], month %in% c("July", "August"))
+  
+  # Calculate standard alpha diversity metrics
+  alpha <- estimate_richness(ps_sub, measures = indices[1:3])
+  
+  # Calculate Faith's PD if phylogenetic tree exists, else assign NA
+  if (!is.null(phy_tree(ps_sub, errorIfNULL = FALSE))) {
+    otu <- as(otu_table(ps_sub), "matrix")
+    if (taxa_are_rows(ps_sub)) otu <- t(otu)
+    alpha$FaithsPD <- pd(otu, phy_tree(ps_sub), include.root = FALSE)$PD
+  } else { 
+    alpha$FaithsPD <- NA 
+  }
+  
+  # Combine metadata, reshape to long format, and execute group-wise Kruskal-Wallis tests
+  cbind(data.frame(sample_data(ps_sub)), alpha) %>%
+    pivot_longer(cols = any_of(indices), names_to = "Metric", values_to = "Val") %>%
+    drop_na(Val) %>%
+    group_by(Metric) %>%
+    kruskal_test(Val ~ type) %>%
+    pivot_wider(
+      id_cols     = c(n, df), 
+      names_from  = Metric, 
+      values_from = c(statistic, p), 
+      names_glue  = "{Metric}_{.value}"
+    ) %>%
+    mutate(Subset = sub_name, .before = 1)
+})
+
+# Ensure all expected metric columns exist even if FaithsPD was skipped
+for (m in indices) {
+  if (!paste0(m, "_statistic") %in% names(raw_kw_sampling)) raw_kw_sampling[[paste0(m, "_statistic")]] <- NA_real_
+  if (!paste0(m, "_p") %in% names(raw_kw_sampling)) raw_kw_sampling[[paste0(m, "_p")]] <- NA_real_
+}
+
+# ------------------------------------------------------------------------------
+# 3. Format & Export Final Manuscript Table (Table S2A)
+# ------------------------------------------------------------------------------
+# Select and rename columns for publication layout
+final_kw_sampling_table <- raw_kw_sampling %>%
+  select(
+    Subset,
+    N = n,
+    df,
+    `Observed H`          = Observed_statistic,
+    `Observed p`          = Observed_p,
+    `Shannon H`           = Shannon_statistic,
+    `Shannon p`           = Shannon_p,
+    `Inverse Simpson H`   = InvSimpson_statistic,
+    `Inverse Simpson p`   = InvSimpson_p,
+    `Faith's PD H`        = FaithsPD_statistic,
+    `Faith's PD p`        = FaithsPD_p
+  )
+
+# Display formatted table in console
+print(final_kw_sampling_table)
+
+# Export to statistics directory
+dir.create("statistics", showWarnings = FALSE, recursive = TRUE)
+write.csv(final_kw_sampling_table, "statistics/Table_S2A.csv", row.names = FALSE)
+```
+
+
+
+
+
+
+
+
+# Figure 2: Beta Diversity
+## Beta Diversity 
+```{r Algae: NMDS Plot}
+# ------------------------------------------------------------------------------
+# 1. Temporal Metadata Formatting
+# ------------------------------------------------------------------------------
+# Order sampling months chronologically for consistent plot legend ordering
+sample_data(ps_algae_rarefied)$month <- factor(
+  sample_data(ps_algae_rarefied)$month, 
+  levels = c("March", "April", "May", "June", 
+             "July", "August", "September", "October")
+)
+
+# ------------------------------------------------------------------------------
+# 2. Compute Non-Metric Multidimensional Scaling (NMDS)
+# ------------------------------------------------------------------------------
+# Calculate Bray-Curtis distance matrix and run NMDS ordination
+nmds_ord_algae <- ordinate(ps_algae_rarefied, method = "NMDS", distance = "bray")
+
+# ------------------------------------------------------------------------------
+# 3. Construct Ordination Plot
+# ------------------------------------------------------------------------------
+# Extract baseline ordination coordinates and clear default phyloseq layers
+# 1. Ensure month factor levels are ordered
+ps_algae_rarefied@sam_data$month <- factor(
+  ps_algae_rarefied@sam_data$month,
+  levels = c("March", "April", "May", "June", "July", "August", "September", "October"),
+  ordered = TRUE
+)
+
+# 2. Re-spaced 8-step Blue Scale (Optimized for equal perceived steps)
+blue_hues <- c(
+  "March"     = "#EFF3FF",  # Very light ice blue
+  "April"     = "#C6DBEF",  # Soft sky blue
+  "May"       = "#9ECAE1",  # Light blue
+  "June"      = "#6BAED6",  # Medium blue
+  "July"      = "#4292C6",  # Deep cerulean
+  "August"    = "#2171B5",  # Royal blue
+  "September" = "#08519C",  # Navy blue
+  "October"   = "#081D58"   # Dark indigo-navy (lightened enough to read)
+)
+
+# 3. Build plot with subtle outline for clarity
+nmds_algae <- plot_ordination(ps_algae_rarefied, nmds_ord, type = "samples")
+nmds_algae$layers <- NULL
+
+nmds_algae <- nmds_algae + 
+  geom_point(
+    aes(fill = month, shape = type), 
+    size = 3.8,      
+    stroke = 0.5,  
+    color = "grey20"  # Dark grey outline instead of pure black
+  ) +
+  scale_shape_manual(values = c("active" = 21, "passive" = 24)) +
+  scale_fill_manual(values = blue_hues) +
+  guides(
+    fill = guide_legend(override.aes = list(shape = 21, stroke = 0.5, color = "grey20")),
+    shape = guide_legend(override.aes = list(
+      fill = "white", 
+      color = "grey20",
+      stroke = 0.5 
+    ))
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    legend.title     = element_text(size = 12),
+    axis.text        = element_text(size = 11),
+    legend.text      = element_text(size = 11),
+    text             = element_text(color = "black")
+  ) +
+  labs(
+    title = "Algae", 
+    fill  = "Sampling Month", 
+    shape = "Sample Type"
+  ) +
+  force_panelsizes(
+    rows = unit(4, "in"), 
+    cols = unit(4, "in")
+  )
+
+print(nmds_algae)
+
+# ------------------------------------------------------------------------------
+# 4. Export Figure
+# ------------------------------------------------------------------------------
+ggsave("Analysis/Figures/All/Figure_2A.png", nmds_algae, height = 5, width = 6, dpi = 300)
+
+
+# 5. Stress
+
+print(nmds_ord_algae$stress)
+```
+
+```{r Statistics Algae: Permanova}
+# Ensure output directory exists
+dir.create("statistics", showWarnings = FALSE, recursive = TRUE)
+
+# ==============================================================================
+# 1. TEMPORAL ANALYSIS (Active Sampling Only)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1.1 Data Preparation & Distance Matrix
+# ------------------------------------------------------------------------------
+# Subset dataset to active sampling methods across all months
+ps_algae_active   <- subset_samples(ps_algae_rarefied, type == "active")
+dist_algae_active <- phyloseq::distance(ps_algae_active, method = "bray")
+meta_algae_active <- data.frame(sample_data(ps_algae_active))
+
+# ------------------------------------------------------------------------------
+# 1.2 Temporal PERMANOVA
+# ------------------------------------------------------------------------------
+set.seed(123)
+permanova_algae_month <- adonis2(dist_algae_active ~ month, data = meta_algae_active)
+print(permanova_algae_month)
+
+sink("statistics/Algae_permanova_temporal.txt")
+print(permanova_algae_month)
+sink()
+
+# ------------------------------------------------------------------------------
+# 1.3 NMDS Ordination Stress Evaluation
+# ------------------------------------------------------------------------------
+set.seed(123)
+nmds_nmds_ord_algae <- metaMDS(dist_algae_active, k = 2, trymax = 100)
+cat("NMDS Stress Value: ", nmds_ord_algae$stress, "\n")
+
+sink("statistics/Algae_NMDS_Stress.txt")
+cat("NMDS Stress Value: ", nmds_ord_algae$stress, "\n")
+sink()
+
+# ------------------------------------------------------------------------------
+# 1.4 Temporal Homogeneity of Multivariate Dispersions (PERMDISP)
+# ------------------------------------------------------------------------------
+disper_algae_month <- betadisper(dist_algae_active, group = meta_algae_active$month)
+
+set.seed(123)
+disper_algae_month_test <- permutest(disper_algae_month, permutations = 999)
+print(disper_algae_month_test)
+
+sink("statistics/Algae_betadisper_temporal.txt")
+print(disper_algae_month)
+print(disper_algae_month_test)
+sink()
+
+
+# ==============================================================================
+# 2. METHODOLOGICAL ANALYSIS (July & August Only: Active vs. Passive)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 2.1 Data Preparation & Distance Matrix
+# ------------------------------------------------------------------------------
+# Subset dataset to peak bloom months comparing sampling methods
+ps_algae_type   <- subset_samples(ps_algae_rarefied, month %in% c("July", "August"))
+dist_algae_type <- phyloseq::distance(ps_algae_type, method = "bray")
+meta_algae_type <- data.frame(sample_data(ps_algae_type))
+
+# ------------------------------------------------------------------------------
+# 2.2 Factorial PERMANOVA (Method x Month Interaction)
+# ------------------------------------------------------------------------------
+set.seed(123)
+permanova_algae_type <- adonis2(
+  dist_algae_type ~ type * month, 
+  data = meta_algae_type, 
+  by = "terms"
+)
+print(permanova_algae_type)
+
+sink("statistics/Algae_permanova_method.txt")
+print(permanova_algae_type)
+sink()
+
+# ------------------------------------------------------------------------------
+# 2.3 Sampling Method Homogeneity of Multivariate Dispersions (PERMDISP)
+# ------------------------------------------------------------------------------
+disper_algae_type <- betadisper(dist_algae_type, group = meta_algae_type$type)
+
+set.seed(123)
+disper_algae_type_test <- permutest(disper_algae_type, permutations = 999)
+print(disper_algae_type_test)
+
+sink("statistics/Algae_betadisper_method.txt")
+print(disper_algae_type)
+print(disper_algae_type_test)
+sink()
+```
+
+```{r HAB taxa: NMDS Plot}
+# ------------------------------------------------------------------------------
+# 1. Temporal Metadata Formatting
+# ------------------------------------------------------------------------------
+# Order sampling months chronologically for consistent plot legend ordering
+sample_data(ps_HAB)$month <- factor(
+  sample_data(ps_HAB)$month, 
+  levels = c("March", "April", "May", "June", 
+             "July", "August", "September", "October")
+)
+
+# ------------------------------------------------------------------------------
+# 2. Compute Non-Metric Multidimensional Scaling (NMDS)
+# ------------------------------------------------------------------------------
+# Calculate Bray-Curtis distance matrix and run NMDS ordination
+nmds_ord_HAB <- ordinate(ps_HAB, method = "NMDS", distance = "bray")
+
+# ------------------------------------------------------------------------------
+# 3. Construct Ordination Plot
+# ------------------------------------------------------------------------------
+# Extract baseline ordination coordinates and clear default phyloseq layers
+# 1. Ensure month factor levels are ordered
+ps_HAB@sam_data$month <- factor(
+  ps_HAB@sam_data$month,
+  levels = c("March", "April", "May", "June", "July", "August", "September", "October"),
+  ordered = TRUE
+)
+
+# 2. Re-spaced 8-step Blue Scale (Optimized for equal perceived steps)
+blue_hues <- c(
+  "March"     = "#EFF3FF",  # Very light ice blue
+  "April"     = "#C6DBEF",  # Soft sky blue
+  "May"       = "#9ECAE1",  # Light blue
+  "June"      = "#6BAED6",  # Medium blue
+  "July"      = "#4292C6",  # Deep cerulean
+  "August"    = "#2171B5",  # Royal blue
+  "September" = "#08519C",  # Navy blue
+  "October"   = "#081D58"   # Dark indigo-navy (lightened enough to read)
+)
+
+# 3. Build plot with subtle outline for clarity
+nmds_HAB <- plot_ordination(ps_HAB, nmds_ord, type = "samples")
+nmds_HAB$layers <- NULL
+
+nmds_HAB <- nmds_HAB + 
+  geom_point(
+    aes(fill = month, shape = type), 
+    size = 3.8,      
+    stroke = 0.5,  
+    color = "grey20"  # Dark grey outline instead of pure black
+  ) +
+  scale_shape_manual(values = c("active" = 21, "passive" = 24)) +
+  scale_fill_manual(values = blue_hues) +
+  guides(
+    fill = guide_legend(override.aes = list(shape = 21, stroke = 0.5, color = "grey20")),
+    shape = guide_legend(override.aes = list(
+      fill = "white", 
+      color = "grey20",
+      stroke = 0.5 
+    ))
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    legend.title     = element_text(size = 12),
+    axis.text        = element_text(size = 11),
+    legend.text      = element_text(size = 11),
+    text             = element_text(color = "black")
+  ) +
+  labs(
+    title = "HAB Taxa", 
+    fill  = "Sampling Month", 
+    shape = "Sample Type"
+  ) +
+  force_panelsizes(
+    rows = unit(4, "in"), 
+    cols = unit(4, "in")
+  )
+
+print(nmds_HAB)
+
+# ------------------------------------------------------------------------------
+# 4. Export Figure
+# ------------------------------------------------------------------------------
+ggsave("Analysis/Figures/All/Figure_2B.png", nmds_HAB, height = 5, width = 6, dpi = 300)
+
+# 5. Stress
+
+print(nmds_ord_HAB$stress)
+```
+
+```{r Statistics HAB: Permanova}
+# Ensure output directory exists
+dir.create("statistics", showWarnings = FALSE, recursive = TRUE)
+
+# ==============================================================================
+# 1. TEMPORAL ANALYSIS (Active Sampling Only)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1.1 Data Preparation & Distance Matrix
+# ------------------------------------------------------------------------------
+# Subset dataset to active sampling methods across all months
+ps_HAB_active   <- subset_samples(ps_HAB_rarefied, type == "active")
+dist_HAB_active <- phyloseq::distance(ps_HAB_active, method = "bray")
+meta_HAB_active <- data.frame(sample_data(ps_HAB_active))
+
+# ------------------------------------------------------------------------------
+# 1.2 Temporal PERMANOVA
+# ------------------------------------------------------------------------------
+set.seed(123)
+permanova_HAB_month <- adonis2(dist_HAB_active ~ month, data = meta_HAB_active)
+print(permanova_HAB_month)
+
+sink("statistics/HAB_permanova_temporal.txt")
+print(permanova_HAB_month)
+sink()
+
+# ------------------------------------------------------------------------------
+# 1.3 NMDS Ordination Stress Evaluation
+# ------------------------------------------------------------------------------
+set.seed(123)
+nmds_nmds_ord_HAB <- metaMDS(dist_HAB_active, k = 2, trymax = 100)
+cat("NMDS Stress Value: ", nmds_ord_HAB$stress, "\n")
+
+sink("statistics/HAB_NMDS_Stress.txt")
+cat("NMDS Stress Value: ", nmds_ord_HAB$stress, "\n")
+sink()
+
+# ------------------------------------------------------------------------------
+# 1.4 Temporal Homogeneity of Multivariate Dispersions (PERMDISP)
+# ------------------------------------------------------------------------------
+disper_HAB_month <- betadisper(dist_HAB_active, group = meta_HAB_active$month)
+
+disper_HAB_month_test <- permutest(disper_HAB_month, permutations = 999)
+print(disper_HAB_month_test)
+
+sink("statistics/HAB_betadisper_temporal.txt")
+print(disper_HAB_month)
+print(disper_HAB_month_test)
+sink()
+
+# ==============================================================================
+# 2. METHODOLOGICAL ANALYSIS (July & August Only: Active vs. Passive)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 2.1 Data Preparation & Distance Matrix
+# ------------------------------------------------------------------------------
+# Subset dataset to peak bloom months comparing sampling methods
+ps_HAB_type   <- subset_samples(ps_HAB_rarefied, month %in% c("July", "August"))
+dist_HAB_type <- phyloseq::distance(ps_HAB_type, method = "bray")
+meta_HAB_type <- data.frame(sample_data(ps_HAB_type))
+
+# ------------------------------------------------------------------------------
+# 2.2 Factorial PERMANOVA (Method x Month Interaction)
+# ------------------------------------------------------------------------------
+
+permanova_HAB_type <- adonis2(
+  dist_HAB_type ~ type * month, 
+  data = meta_HAB_type, 
+  by = "terms"
+)
+print(permanova_HAB_type)
+
+sink("statistics/HAB_permanova_method.txt")
+print(permanova_HAB_type)
+sink()
+
+# ------------------------------------------------------------------------------
+# 2.3 Sampling Method Homogeneity of Multivariate Dispersions (PERMDISP)
+# ------------------------------------------------------------------------------
+disper_HAB_type <- betadisper(dist_HAB_type, group = meta_HAB_type$type)
+
+disper_HAB_type_test <- permutest(disper_HAB_type, permutations = 999)
+print(disper_HAB_type_test)
+
+sink("statistics/HAB_betadisper_method.txt")
+print(disper_HAB_type)
+print(disper_HAB_type_test)
+sink()
+```
+
+
+
+
+
+
+
+
+# Figure 3: Relative Taxon Abundance: Seasonal
+```{r 3A Algae: Class-level Relative Abundance Plot}
+# ------------------------------------------------------------------------------
+# 1. Color Palette & Abundance Threshold Definition
+# ------------------------------------------------------------------------------
+# Strict colorblind-friendly palette (Okabe-Ito / Tol qualitative mix)
+algae_colors <- c(
+  "Other"             = "#888888", # Neutral Grey
+  "Cryptophyceae"     = "#56B4E9", # Sky Blue
+  "Dinophyceae"       = "#E69F00", # Warm Amber / Gold
+  "Mamiellophyceae"   = "#009E73", # Teal Green
+  "Mediophyceae"      = "#0072B2", # Strong Blue
+  "Prymnesiophyceae"  = "#D55E00", # Vermilion / Rust
+  "Syndiniales"       = "#CC79A7", # Reddish Purple / Magenta
+  "Ulvophyceae"       = "#F0E442", # Bright Yellow
+  "Bacillariophyceae" = "#661100", # Dark Chestnut Brown
+  "Chrysophyceae"     = "#AA4499", # Bright Purple
+  "Picomonadea"       = "#66CCEE", # High-contrast Ice Blue
+  "Picozoa_XX"        = "#332299", # Deep Navy
+  "Telonemia_XX"      = "#DDCC77"  # Pale Sand / Ochre
+)
+
+# Relative abundance filtering threshold (2%)
+threshold <- 0.02  
+
+# ------------------------------------------------------------------------------
+# 2. Phyloseq Processing & Taxonomic Agglomeration
+# ------------------------------------------------------------------------------
+# Filter metadata for active sampling methods only
+ps_algae_active <- subset_samples(ps_algae_rarefied, type == "active")
+
+# Convert raw rarefied counts to relative abundance (0–1 scale)
+ps_rel_algae <- transform_sample_counts(ps_algae_active, function(x) x / sum(x))
+
+# Agglomerate relative abundances to Class level
+ps_class_algae <- tax_glom(ps_rel_algae, taxrank = "Class", NArm = FALSE)
+
+# Melt phyloseq object to long data frame for ggplot formatting
+df_long_algae <- psmelt(ps_class_algae)
+
+# ------------------------------------------------------------------------------
+# 3. Community Relative Abundance Summarization & Low-Abundance Collapsing
+# ------------------------------------------------------------------------------
+plot_data_algae <- df_long_algae %>%
+  mutate(
+    Class = case_when(
+      is.na(Class) | str_trim(Class) %in% c("", "NA") ~ "Other",
+      TRUE ~ Class
+    )
+  ) %>%
+  # Calculate monthly mean relative abundance per Class
+  group_by(month, Class) %>%
+  summarise(mean_rel_abund = mean(Abundance), .groups = "drop") %>%
+  # Re-normalize to ensure 100% per month
+  group_by(month) %>%
+  mutate(mean_rel_abund = mean_rel_abund / sum(mean_rel_abund)) %>%
+  # Collapse classes below the threshold into "Other"
+  mutate(
+    Class_collapsed = if_else(mean_rel_abund < threshold, "Other", Class)
+  ) %>%
+  # Re-aggregate collapsed classes
+  group_by(month, Class_collapsed) %>%
+  summarise(mean_rel_abund = sum(mean_rel_abund), .groups = "drop") %>%
+  # Order months chronologically
+  mutate(
+    month = factor(month, levels = c("March", "April", "May", "June", 
+                                     "July", "August", "September", "October"))
+  ) %>%
+  filter(!is.na(month))
+
+# Set factor levels to place "Other" first in legend ordering
+unique_classes_algae <- sort(unique(plot_data_algae$Class_collapsed))
+legend_order_algae   <- c("Other", setdiff(unique_classes_algae, "Other"))
+
+write.csv(plot_data_algae,"Manuscript/Tables/Algae_Rel_Abund_Class.csv")
+
+# ------------------------------------------------------------------------------
+# 4. Construct Stacked Relative Abundance Bar Plot
+# ------------------------------------------------------------------------------
+algae_Class <- ggplot(
+  plot_data_algae, 
+  aes(x = month, y = mean_rel_abund, fill = factor(Class_collapsed, levels = legend_order_algae))
+) +
+  geom_col(position = position_stack(reverse = FALSE), width = 0.7, color = "black", linewidth = 0.2) +
+  scale_y_continuous(labels = scales::percent, expand = c(0, 0)) +
+  scale_fill_manual(values = algae_colors, name = "Class") +
+  labs(
+    x     = "Sampling Month",
+    y     = "Relative Abundance",
+    title = "A) Algal Taxa"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    text         = element_text(color = "black"),
+    plot.title   = element_text(color = "black", size = 13, face = "bold"),
+    axis.title.x = element_text(color = "black", size = 12),
+    axis.title.y = element_text(color = "black", size = 12),
+    axis.text.x  = element_text(angle = 45, hjust = 1, color = "black", size = 11),
+    axis.text.y  = element_text(color = "black", size = 11),
+    legend.title = element_text(color = "black", face = "bold", size = 12),
+    legend.text  = element_text(color = "black", size = 11),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8)
+  ) +
+  force_panelsizes(rows = unit(3, "in"), cols = unit(4, "in"))
+
+# Display plot in console
+print(algae_Class)
+
+# ------------------------------------------------------------------------------
+# 5. Export Figure
+# ------------------------------------------------------------------------------
+dir.create("figures", showWarnings = FALSE, recursive = TRUE)
+ggsave("figures/Figure_3A.png", algae_Class, height = 5, width = 7, dpi = 300)
+```
+```{r 3B HAB Taxa: Genus-level Relative Abundance Plot}
+# ------------------------------------------------------------------------------
+# 1. Setup & Abundance Threshold Definition
+# ------------------------------------------------------------------------------
+# Relative abundance filtering threshold (2%)
+threshold <- 0.02 
+
+# ------------------------------------------------------------------------------
+# 2. Phyloseq Processing & Taxonomic Agglomeration
+# ------------------------------------------------------------------------------
+# Subset dataset to active sampling methods only
+ps_HAB_active <- subset_samples(ps_HAB, type == "active")
+
+# Convert raw rarefied counts to relative abundance (0–1 scale)
+ps_rel <- transform_sample_counts(ps_HAB_active, function(x) x / sum(x))
+
+# Agglomerate relative abundances to Genus level
+ps_Genus <- tax_glom(ps_rel, taxrank = "Genus", NArm = FALSE)
+
+# Melt phyloseq object to long data frame for ggplot formatting
+df_long <- psmelt(ps_Genus)
+
+# ------------------------------------------------------------------------------
+# 3. Community Relative Abundance Summarization & Low-Abundance Collapsing
+# ------------------------------------------------------------------------------
+plot_data_HAB <- df_long %>%
+  mutate(
+    Genus = case_when(
+      is.na(Genus) | str_trim(Genus) %in% c("", "NA") ~ "Other",
+      TRUE ~ Genus
+    )
+  ) %>%
+  # Calculate monthly mean relative abundance per Genus
+  group_by(month, Genus) %>%
+  summarise(mean_rel_abund = mean(Abundance), .groups = "drop") %>%
+  # Re-normalize to ensure 100% per month
+  group_by(month) %>%
+  mutate(mean_rel_abund = mean_rel_abund / sum(mean_rel_abund)) %>%
+  # Collapse genera below threshold into "Other"
+  mutate(
+    Genus_collapsed = if_else(mean_rel_abund < threshold, "Other", Genus)
+  ) %>%
+  # Re-aggregate collapsed genera
+  group_by(month, Genus_collapsed) %>%
+  summarise(mean_rel_abund = sum(mean_rel_abund), .groups = "drop") %>%
+  # Order months chronologically
+  mutate(
+    month = factor(month, levels = c("March", "April", "May", "June", 
+                                     "July", "August", "September", "October"))
+  ) %>%
+  filter(!is.na(month))
+
+# ------------------------------------------------------------------------------
+# 4. Colorblind-Friendly Palette & Legend Label Formatting
+# ------------------------------------------------------------------------------
+unique_Genus <- sort(unique(plot_data_HAB$Genus_collapsed))
+
+# Position "Other" at the base of the stack and top of legend
+legend_order <- c("Other", setdiff(unique_Genus, "Other"))
+num_genera   <- length(setdiff(legend_order, "Other"))
+
+# Extended Paul Tol Qualitative Palette (Bright + Vibrant)
+tol_qualitative <- c("#EE6677", "#4477AA", "#CCBB44", "#228833", 
+                     "#AA3377", "#66CCEE", "#E69F00", "#009E73", "#56B4E9")
+
+# Expand palette dynamically if distinct genera exceed palette length
+if (num_genera <= length(tol_qualitative)) {
+  base_colors <- tol_qualitative[1:num_genera]
+} else {
+  base_colors <- colorRampPalette(tol_qualitative)(num_genera)
+}
+
+# Shuffle colors to maximize visual separation between adjacent stacked bars
+set.seed(42) # Ensure reproducible color assignment across re-runs
+shuffled_colors <- sample(base_colors)
+
+# Map neutral dark grey to "Other" and shuffled colors to genera
+my_colors <- setNames(c("#777777", shuffled_colors), legend_order)
+
+# Format legend labels: plain text for "Other", italicized for taxonomic genus names
+legend_labels <- parse(text = ifelse(legend_order == "Other", "'Other'", paste0("italic('", legend_order, "')")))
+
+# ------------------------------------------------------------------------------
+# 5. Construct Stacked Relative Abundance Bar Plot
+# ------------------------------------------------------------------------------
+HAB_Genus <- ggplot(
+  plot_data_HAB, 
+  aes(x = month, y = mean_rel_abund, fill = factor(Genus_collapsed, levels = legend_order))
+) +
+  geom_col(position = position_stack(reverse = FALSE), width = 0.7, color = "black", linewidth = 0.2) +
+  scale_y_continuous(labels = scales::percent, expand = c(0, 0)) +
+  scale_fill_manual(values = my_colors, name = "Genus", labels = legend_labels) +
+  labs(
+    x     = "Sampling Month",
+    y     = "Relative Abundance",
+    title = "B) Genera containing HAB species"
+  ) +
+  theme_classic(base_size = 12, base_family = "Helvetica") +
+  theme(
+    text             = element_text(color = "black"),
+    plot.title       = element_text(color = "black", size = 13, face = "bold"),
+    strip.text       = element_text(color = "black", size = 13, face = "bold", hjust = 0),
+    strip.background = element_blank(), 
+    axis.title.x     = element_text(color = "black", size = 12),
+    axis.title.y     = element_text(color = "black", size = 12),
+    axis.text.x      = element_text(angle = 45, hjust = 1, color = "black", size = 11),
+    axis.text.y      = element_text(color = "black", size = 11),
+    legend.title     = element_text(color = "black", face = "bold", size = 12),
+    legend.text      = element_text(color = "black", size = 11),
+    panel.border     = element_rect(color = "black", fill = NA, linewidth = 0.8)
+  ) +
+  force_panelsizes(rows = unit(3, "in"), cols = unit(4, "in"))
+
+# Display plot in console
+print(HAB_Genus)
+
+# ------------------------------------------------------------------------------
+# 6. Export Figure
+# ------------------------------------------------------------------------------
+dir.create("figures", showWarnings = FALSE, recursive = TRUE)
+ggsave("figures/Figure_3B.png", HAB_Genus, height = 5, width = 7, dpi = 300)
+```
+```{r Algae: Save Species-level Relabund Table }
+threshold <- 0.02 
+
+# Subset dataset to active sampling methods only
+ps_algae_active <- subset_samples(ps_algae_rarefied, type == "active")
+
+# Convert raw rarefied counts to relative abundance (0–1 scale)
+ps_rel <- transform_sample_counts(ps_algae_active, function(x) x / sum(x))
+
+# Agglomerate relative abundances to Species level
+ps_Species <- tax_glom(ps_rel, taxrank = "Species", NArm = FALSE)
+
+# Melt phyloseq object to long data frame for ggplot formatting
+df_long_Species <- psmelt(ps_Species)
+
+dir.create("tables", showWarnings = FALSE, recursive = TRUE)
+write.csv(df_long_Species, "tables/Algae_Relabund_Species.csv")
+```
+```{r HAB Taxa: Save Species-level Relative abundance Table}
+threshold <- 0.02 
+
+# Subset dataset to active sampling methods only
+ps_HAB_active <- subset_samples(ps_HAB, type == "active")
+
+# Convert raw rarefied counts to relative abundance (0–1 scale)
+ps_rel <- transform_sample_counts(ps_HAB_active, function(x) x / sum(x))
+
+# Agglomerate relative abundances to Species level
+ps_Species <- tax_glom(ps_rel, taxrank = "Species", NArm = FALSE)
+
+# Melt phyloseq object to long data frame for ggplot formatting
+df_long_Species <- psmelt(ps_Species)
+
+dir.create("tables", showWarnings = FALSE, recursive = TRUE)
+write.csv(df_long_Species, "tables/HAB_Relabund_Species.csv")
+```
+
+
+
+
+
+
+# Figure 4: HAB Seasonal Dynamics
+```{r Pseudo-nitzschia species(complex) line plot}
+# Ensure output directory exists for exported figures
+dir.create("figures", showWarnings = FALSE, recursive = TRUE)
+
+# ==============================================================================
+# 1. SEQUENCE ALIGNMENT & TAXONOMIC MATCHING (PR2 DATABASE)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1.1 Subset Pseudo-nitzschia ASVs and Reference Data
+# ------------------------------------------------------------------------------
+# Extract Pseudo-nitzschia ASVs, reference sequences, and total read counts
+ps_pn     <- subset_taxa(ps_algae, Genus == "Pseudo-nitzschia")
+asv_seqs  <- refseq(ps_pn)
+asv_reads <- taxa_sums(ps_pn)
+
+# Load PR2 reference database and filter for Pseudo-nitzschia reference entries
+pr2    <- readDNAStringSet("pr2_v5.1.1_SSU_dada2.fasta.gz")
+pr2_pn <- pr2[str_detect(names(pr2), "Pseudo-nitzschia")]
+
+# ------------------------------------------------------------------------------
+# 1.2 Pairwise Alignment against PR2 Reference Database
+# ------------------------------------------------------------------------------
+# Align each ASV to PR2 entries to calculate percent identity and extract top matches
+pn_aligned <- map_dfr(names(asv_seqs), function(id) {
+  # Perform global-local pairwise alignment and calculate percent identity (PID1)
+  pids    <- pid(pairwiseAlignment(pr2_pn, asv_seqs[[id]], type = "global-local"), type = "PID1")
+  max_pid <- max(pids)
+  
+  # Extract top-matching reference headers at maximum identity
+  top_headers   <- names(pr2_pn)[pids == max_pid]
+  clean_headers <- gsub(";\\s*$", "", top_headers)
+  top_species   <- unique(str_replace_all(sub(".*[;|]", "", clean_headers), "_", " "))
+  
+  data.frame(
+    OTU             = id,
+    `Read number`   = asv_reads[[id]],
+    Pct_Identity    = round(max_pid, 2),
+    `Top PR2 Match` = paste(top_species[top_species != ""], collapse = " / "),
+    check.names     = FALSE,
+    stringsAsFactors = FALSE
+  )
+})
+
+# ------------------------------------------------------------------------------
+# 1.3 Filter & Summarize Species Complexes
+# ------------------------------------------------------------------------------
+# Filter for 100% identity matches and minimum read count threshold (>= 10 reads)
+pn_complex_summary <- pn_aligned %>%
+  filter(Pct_Identity == 100, `Read number` >= 10) %>%
+  mutate(
+    `Species (complex)` = case_when(
+      grepl("pungens", `Top PR2 Match`, ignore.case = TRUE) ~ "P. pungens",
+      grepl("delicatissima|pseudodelicatissima", `Top PR2 Match`, ignore.case = TRUE) ~ "P. delicatissima complex",
+      grepl("australis|seriata", `Top PR2 Match`, ignore.case = TRUE) ~ "P. seriata complex",
+      TRUE ~ "Pseudo-nitzschia sp."
+    )
+  ) %>%
+  group_by(`Species (complex)`, `Top PR2 Match`) %>%
+  summarise(
+    `Read number` = sum(`Read number`),
+    .groups       = "drop"
+  ) %>%
+  arrange(desc(`Read number`))
+
+# Print summary table to console
+print(pn_complex_summary)
+
+
+# ==============================================================================
+# 2. SEASONAL RELATIVE ABUNDANCE ANALYSIS & PLOTTING
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 2.1 Map High-Confidence Categories & Merge with Community Profiles
+# ------------------------------------------------------------------------------
+# Map OTUs with 100% PR2 identity and >= 10 reads to their assigned match category
+asv_categories <- pn_aligned %>%
+  filter(Pct_Identity == 100, `Read number` >= 10) %>%
+  mutate(Category = `Top PR2 Match`) %>%
+  dplyr::select(OTU, Category)
+
+# Convert community counts to relative abundance (%) and join category mappings
+ps_rel <- transform_sample_counts(ps_algae, function(x) x / sum(x) * 100)
+
+pn_data <- psmelt(ps_rel) %>%
+  inner_join(asv_categories, by = "OTU") %>%
+  group_by(Sample, month, Category) %>%
+  summarize(Abundance = sum(Abundance), .groups = "drop")
+
+# ------------------------------------------------------------------------------
+# 2.2 Rank & Filter Taxa Categories
+# ------------------------------------------------------------------------------
+# Retain categories with overall mean abundance >= 0.01% and rank by mean abundance
+category_order <- pn_data %>%
+  group_by(Category) %>%
+  summarize(Overall_Mean = mean(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  filter(Overall_Mean >= 0.01) %>%
+  arrange(desc(Overall_Mean)) %>%
+  pull(Category)
+
+month_order <- c("March", "April", "May", "June", 
+                 "July", "August", "September", "October")
+
+# Summarize monthly mean relative abundance and standard error (SE)
+plot_data_pn <- pn_data %>%
+  filter(Category %in% category_order) %>%
+  group_by(month, Category) %>%
+  summarize(
+    Mean_Abundance = mean(Abundance, na.rm = TRUE),
+    SE             = sd(Abundance, na.rm = TRUE) / sqrt(n()),
+    .groups        = "drop"
+  ) %>%
+  mutate(
+    month    = factor(month, levels = month_order),
+    Category = factor(Category, levels = category_order) # Controls legend ordering
+  )
+
+#write.csv(plot_data_pn,"Analysis/Tables/all/Pseudo-nitzschia_RelAbund.csv")
+
+# ------------------------------------------------------------------------------
+# 2.3 Aesthetic Styling & Markdown Legend Formatting
+# ------------------------------------------------------------------------------
+# Format legend labels using Markdown syntax for selective taxonomic italicization
+legend_labels <- category_order %>%
+  str_replace_all("\\bPseudo-nitzschia\\b", "*Pseudo-nitzschia*") %>%
+  str_replace_all("\\bP\\.", "*P.*") %>%
+  str_replace_all("\\b([a-z]{3,})\\b", "*\\1*") %>%
+  str_replace_all("\\*sp\\*\\.", "sp.") %>%
+  str_replace_all("\\*sp\\*", "sp") %>%
+  str_replace_all("\\*complex\\*", "complex") %>%
+  str_replace_all("\\* \\*", " ")
+
+n_cats <- length(category_order)
+
+# Subset palettes dynamically to match category count
+orange_palette <- c("#541500", "#8C2D04", "#F16913", "#FDAE6B", "#E6550D", "#A63603")[1:n_cats]
+shape_palette  <- c(16, 17, 15, 18, 25, 19, 8)[1:n_cats]
+
+# ------------------------------------------------------------------------------
+# 2.4 Construct Seasonal Dynamics Line Plot
+# ------------------------------------------------------------------------------
+Pseudonitzschia_seasonal <- ggplot(
+  plot_data_pn, 
+  aes(x = month, y = Mean_Abundance, group = Category, color = Category, fill = Category, shape = Category)
+) +
+  geom_ribbon(
+    aes(ymin = pmax(0, Mean_Abundance - SE), ymax = Mean_Abundance + SE), 
+    alpha = 0.20, 
+    color = NA
+  ) +
+  geom_line(linewidth = 0.6) +
+  geom_point(size = 2) +
+  scale_color_manual(values = orange_palette, labels = legend_labels) +
+  scale_fill_manual(values = orange_palette, labels = legend_labels) +
+  scale_shape_manual(values = shape_palette, labels = legend_labels) +
+  labs(
+    x = "Sampling Month",
+    y = "Relative Abundance (%)"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1),
+    legend.position  = "right",
+    legend.text      = ggtext::element_markdown(), # Renders Markdown italics in legend
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    legend.title     = element_blank()
+  ) +
+  force_panelsizes(
+    rows = unit(2, "in"), 
+    cols = unit(4, "in")
+  )
+
+# Display plot in console
+print(Pseudonitzschia_seasonal)
+
+# ------------------------------------------------------------------------------
+# 2.5 Export Figure
+# ------------------------------------------------------------------------------
+ggsave("figures/Figure_4_Pseudonitzschia.png", Pseudonitzschia_seasonal, width = 10, height = 3, dpi = 300)
+``` 
+```{r Chaetoceros species(complex) line plot}
+# Ensure output directory exists for exported figures
+dir.create("figures", showWarnings = FALSE, recursive = TRUE)
+
+# ==============================================================================
+# 1. SEQUENCE ALIGNMENT & TAXONOMIC MATCHING (PR2 DATABASE)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1.1 Subset Chaetoceros ASVs and Reference Data
+# ------------------------------------------------------------------------------
+# Extract Chaetoceros ASVs, reference sequences, and total read counts
+ps_ch     <- subset_taxa(ps_algae_rarefied, Genus == "Chaetoceros")
+asv_seqs  <- refseq(ps_ch)
+asv_reads <- taxa_sums(ps_ch)
+
+# Load PR2 reference database and filter for Chaetoceros reference entries
+pr2    <- readDNAStringSet("pr2_v5.1.1_SSU_dada2.fasta.gz")
+pr2_ch <- pr2[str_detect(names(pr2), "Chaetoceros")]
+
+# ------------------------------------------------------------------------------
+# 1.2 Pairwise Alignment against PR2 Reference Database
+# ------------------------------------------------------------------------------
+# Align each ASV to PR2 entries to calculate percent identity and extract top matches
+ch_aligned <- map_dfr(names(asv_seqs), function(id) {
+  # Perform global-local pairwise alignment and calculate percent identity (PID1)
+  pids    <- pid(pairwiseAlignment(pr2_ch, asv_seqs[[id]], type = "global-local"), type = "PID1")
+  max_pid <- max(pids)
+  
+  # Extract top-matching reference headers at maximum identity
+  top_headers   <- names(pr2_ch)[pids == max_pid]
+  clean_headers <- gsub(";\\s*$", "", top_headers)
+  top_species   <- unique(str_replace_all(sub(".*[;|]", "", clean_headers), "_", " "))
+  
+  data.frame(
+    OTU             = id,
+    `Read number`   = asv_reads[[id]],
+    Pct_Identity    = round(max_pid, 2),
+    `Top PR2 Match` = paste(top_species[top_species != ""], collapse = " / "),
+    check.names     = FALSE,
+    stringsAsFactors = FALSE
+  )
+})
+
+# Recode multi-match complexes (e.g., quinquecorne) to 'Chaetoceros sp.'
+ch_aligned <- ch_aligned %>%
+  mutate(
+    `Top PR2 Match` = if_else(
+      grepl("quinquecorne", `Top PR2 Match`, ignore.case = TRUE),
+      "Chaetoceros sp.",
+      `Top PR2 Match`
+    )
+  )
+
+# ------------------------------------------------------------------------------
+# 1.3 Filter & Summarize Taxa Abundances
+# ------------------------------------------------------------------------------
+# Filter for 100% identity matches and minimum read count threshold (>= 10 reads)
+ch_summary <- ch_aligned %>%
+  filter(Pct_Identity == 100, `Read number` >= 10) %>%
+  group_by(`Top PR2 Match`) %>%
+  summarise(
+    `Read number` = sum(`Read number`),
+    .groups       = "drop"
+  ) %>%
+  arrange(desc(`Read number`))
+
+# Print summary table to console
+print(ch_summary)
+
+
+# ==============================================================================
+# 2. SEASONAL RELATIVE ABUNDANCE ANALYSIS & PLOTTING
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 2.1 Map High-Confidence Categories & Merge with Community Profiles
+# ------------------------------------------------------------------------------
+# Map OTUs with 100% PR2 identity and >= 10 reads to their assigned match category
+asv_categories <- ch_aligned %>%
+  filter(Pct_Identity == 100, `Read number` >= 10) %>%
+  mutate(Category = `Top PR2 Match`) %>%
+  dplyr::select(OTU, Category)
+
+# Convert community counts to relative abundance (%) and join category mappings
+ps_rel <- transform_sample_counts(ps_algae, function(x) x / sum(x) * 100)
+
+ch_data <- psmelt(ps_rel) %>%
+  inner_join(asv_categories, by = "OTU") %>%
+  group_by(Sample, month, Category) %>%
+  summarize(Abundance = sum(Abundance), .groups = "drop")
+
+# ------------------------------------------------------------------------------
+# 2.2 Rank & Filter Taxa Categories
+# ------------------------------------------------------------------------------
+# Retain categories with overall mean abundance >= 0.05% and rank by mean abundance
+category_order <- ch_data %>%
+  group_by(Category) %>%
+  summarize(Overall_Mean = mean(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  filter(Overall_Mean >= 0.05) %>%
+  arrange(desc(Overall_Mean)) %>%
+  pull(Category)
+
+month_order <- c("March", "April", "May", "June", 
+                 "July", "August", "September", "October")
+
+# Summarize monthly mean relative abundance and standard error (SE)
+plot_data_ch <- ch_data %>%
+  filter(Category %in% category_order) %>%
+  group_by(month, Category) %>%
+  summarize(
+    Mean_Abundance = mean(Abundance, na.rm = TRUE),
+    SE             = sd(Abundance, na.rm = TRUE) / sqrt(n()),
+    .groups        = "drop"
+  ) %>%
+  mutate(
+    month    = factor(month, levels = month_order),
+    Category = factor(Category, levels = category_order) # Controls legend ordering
+  )
+
+write.csv(plot_data_ch,"Analysis/Tables/all/Chaetoceros_RelAbund.csv")
+
+# ------------------------------------------------------------------------------
+# 2.3 Aesthetic Styling & Markdown Legend Formatting
+# ------------------------------------------------------------------------------
+# Format legend labels using Markdown syntax for selective taxonomic italicization
+legend_labels <- category_order %>%
+  str_replace_all("\\bChaetoceros\\b", "*Chaetoceros*") %>%
+  str_replace_all("\\b([a-z]{3,})\\b", "*\\1*") %>%
+  str_replace_all("\\*sp\\*\\.", "sp.") %>%
+  str_replace_all("\\*sp\\*", "sp") %>%
+  str_replace_all("\\*complex\\*", "complex") %>%
+  str_replace_all("\\* \\*", " ")
+
+n_cats <- length(category_order)
+
+# High-contrast green palette tailored for diatom / algal species dynamics
+high_contrast_greens <- c(
+  "#032B13", # Darkest Pine / Near-Black Green
+  "#005221", # Deep Forest Green
+  "#1B7837", # Rich Kelly Green
+  "#389B48", # Vibrant Medium Green
+  "#52B75B", # Bright Apple Green
+  "#83C853"  # Saturated Meadow/Lime Green
+)
+
+green_palette <- high_contrast_greens[1:n_cats]
+shape_palette <- c(16, 17, 15, 18, 25, 19, 8)[1:n_cats]
+
+# ------------------------------------------------------------------------------
+# 2.4 Construct Seasonal Dynamics Line Plot
+# ------------------------------------------------------------------------------
+Chaetoceros_seasonal <- ggplot(
+  plot_data_ch, 
+  aes(x = month, y = Mean_Abundance, group = Category, color = Category, fill = Category, shape = Category)
+) +
+  geom_ribbon(
+    aes(ymin = pmax(0, Mean_Abundance - SE), ymax = Mean_Abundance + SE), 
+    alpha = 0.20, 
+    color = NA
+  ) +
+  geom_line(linewidth = 0.6) +
+  geom_point(size = 2) +
+  scale_color_manual(values = green_palette, labels = legend_labels) +
+  scale_fill_manual(values = green_palette, labels = legend_labels) +
+  scale_shape_manual(values = shape_palette, labels = legend_labels) +
+  labs(
+    x = "Sampling Month",
+    y = "Relative Abundance (%)"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1),
+    legend.position  = "right",
+    legend.text      = ggtext::element_markdown(), # Renders Markdown italics in legend
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    legend.title     = element_blank()
+  ) +
+  force_panelsizes(
+    rows = unit(2, "in"), 
+    cols = unit(4, "in")
+  )
+
+# Display plot in console
+print(Chaetoceros_seasonal)
+
+# ------------------------------------------------------------------------------
+# 2.5 Export Figure
+# ------------------------------------------------------------------------------
+ggsave("figures/Figure_4_Chaetoceros.png", Chaetoceros_seasonal, width = 10, height = 3, dpi = 300)
+```
+```{r Alexandrium species(complex) line plot}
+# Ensure output directory exists for exported figures
+dir.create("figures", showWarnings = FALSE, recursive = TRUE)
+
+# ==============================================================================
+# 1. SEQUENCE ALIGNMENT & TAXONOMIC MATCHING (PR2 DATABASE)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1.1 Subset Alexandrium ASVs and Reference Data
+# ------------------------------------------------------------------------------
+# Extract Alexandrium ASVs, reference sequences, and total read counts
+ps_alex   <- subset_taxa(ps_algae, Genus == "Alexandrium")
+asv_seqs  <- refseq(ps_alex)
+asv_reads <- taxa_sums(ps_alex)
+
+# Load PR2 reference database and filter for Alexandrium reference entries
+pr2      <- readDNAStringSet("pr2_v5.1.1_SSU_dada2.fasta.gz")
+pr2_alex <- pr2[str_detect(names(pr2), "Alexandrium")]
+
+# ------------------------------------------------------------------------------
+# 1.2 Pairwise Alignment against PR2 Reference Database
+# ------------------------------------------------------------------------------
+# Align each ASV to PR2 entries to calculate percent identity and extract top matches
+alex_aligned <- map_dfr(names(asv_seqs), function(id) {
+  # Perform global-local pairwise alignment and calculate percent identity (PID1)
+  pids    <- pid(pairwiseAlignment(pr2_alex, asv_seqs[[id]], type = "global-local"), type = "PID1")
+  max_pid <- max(pids)
+  
+  # Extract top-matching reference headers at maximum identity
+  top_headers   <- names(pr2_alex)[pids == max_pid]
+  clean_headers <- gsub(";\\s*$", "", top_headers)
+  top_species   <- unique(str_replace_all(sub(".*[;|]", "", clean_headers), "_", " "))
+  
+  data.frame(
+    OTU             = id,
+    `Read number`   = asv_reads[[id]],
+    Pct_Identity    = round(max_pid, 2),
+    `Top PR2 Match` = paste(top_species[top_species != ""], collapse = " / "),
+    check.names     = FALSE,
+    stringsAsFactors = FALSE
+  )
+})
+
+# Recode multi-match complexes (catenella/tamarense) to 'Alexandrium catenella'
+alex_aligned <- alex_aligned %>%
+  mutate(
+    `Top PR2 Match` = if_else(
+      grepl("catenella", `Top PR2 Match`, ignore.case = TRUE) & 
+        grepl("tamarense", `Top PR2 Match`, ignore.case = TRUE),
+      "Alexandrium catenella",
+      `Top PR2 Match`
+    )
+  )
+
+# ------------------------------------------------------------------------------
+# 1.3 Filter & Summarize Taxa Abundances
+# ------------------------------------------------------------------------------
+# Filter for 100% identity matches and minimum read count threshold (>= 10 reads)
+alex_summary <- alex_aligned %>%
+  filter(Pct_Identity == 100, `Read number` >= 10) %>%
+  group_by(`Top PR2 Match`) %>%
+  summarise(
+    `Read number` = sum(`Read number`),
+    .groups       = "drop"
+  ) %>%
+  arrange(desc(`Read number`))
+
+# Print summary table to console
+print(alex_summary)
+
+
+# ==============================================================================
+# 2. SEASONAL RELATIVE ABUNDANCE ANALYSIS & PLOTTING
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 2.1 Map High-Confidence Categories & Merge with Community Profiles
+# ------------------------------------------------------------------------------
+# Map OTUs with 100% PR2 identity and >= 10 reads to their assigned match category
+asv_categories <- alex_aligned %>%
+  filter(Pct_Identity == 100, `Read number` >= 10) %>%
+  mutate(Category = `Top PR2 Match`) %>%
+  dplyr::select(OTU, Category)
+
+# Convert community counts to relative abundance (%) and join category mappings
+ps_rel <- transform_sample_counts(ps_algae, function(x) x / sum(x) * 100)
+
+alex_data <- psmelt(ps_rel) %>%
+  inner_join(asv_categories, by = "OTU") %>%
+  group_by(Sample, month, Category) %>%
+  summarize(Abundance = sum(Abundance), .groups = "drop")
+
+# ------------------------------------------------------------------------------
+# 2.2 Rank & Filter Taxa Categories
+# ------------------------------------------------------------------------------
+# Retain categories with overall mean abundance >= 0.001% and rank by mean abundance
+category_order <- alex_data %>%
+  group_by(Category) %>%
+  summarize(Overall_Mean = mean(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  filter(Overall_Mean >= 0.001) %>%
+  arrange(desc(Overall_Mean)) %>%
+  pull(Category)
+
+month_order <- c("March", "April", "May", "June", 
+                 "July", "August", "September", "October")
+
+# Summarize monthly mean relative abundance and standard error (SE)
+plot_data_alex <- alex_data %>%
+  filter(Category %in% category_order) %>%
+  group_by(month, Category) %>%
+  summarize(
+    Mean_Abundance = mean(Abundance, na.rm = TRUE),
+    SE             = sd(Abundance, na.rm = TRUE) / sqrt(n()),
+    .groups        = "drop"
+  ) %>%
+  mutate(
+    month    = factor(month, levels = month_order),
+    Category = factor(Category, levels = category_order) # Controls legend ordering
+  )
+
+write.csv(plot_data_alex,"Analysis/Tables/all/Alexandrium_RelAbund.csv")
+
+# ------------------------------------------------------------------------------
+# 2.3 Aesthetic Styling & Markdown Legend Formatting
+# ------------------------------------------------------------------------------
+# Format legend labels using Markdown syntax for selective taxonomic italicization
+legend_labels <- category_order %>%
+  str_replace_all("\\bAlexandrium\\b", "*Alexandrium*") %>%
+  str_replace_all("\\b([a-z]{3,})\\b", "*\\1*") %>%
+  str_replace_all("\\*sp\\*\\.", "sp.") %>%
+  str_replace_all("\\*sp\\*", "sp") %>%
+  str_replace_all("\\*complex\\*", "complex") %>%
+  str_replace_all("\\* \\*", " ")
+
+n_cats <- length(category_order)
+
+# High-contrast blue palette tailored for Alexandrium species dynamics
+high_contrast_blues <- c(
+  "#0A3663", # Deep Midnight Blue
+  "#3299D8", # Bright Cerulean Blue
+  "#58B9E3"  # Saturated Steel/Sky Blue
+)
+
+blue_palette  <- high_contrast_blues[1:n_cats]
+shape_palette <- c(16, 17, 15, 18, 25, 19, 8)[1:n_cats]
+
+# ------------------------------------------------------------------------------
+# 2.4 Construct Seasonal Dynamics Line Plot
+# ------------------------------------------------------------------------------
+Alexandrium_seasonal <- ggplot(
+  plot_data_alex, 
+  aes(x = month, y = Mean_Abundance, group = Category, color = Category, fill = Category, shape = Category)
+) +
+  geom_ribbon(
+    aes(ymin = pmax(0, Mean_Abundance - SE), ymax = Mean_Abundance + SE), 
+    alpha = 0.20, 
+    color = NA
+  ) +
+  geom_line(linewidth = 0.6) +
+  geom_point(size = 2) +
+  scale_color_manual(values = blue_palette, labels = legend_labels) +
+  scale_fill_manual(values = blue_palette, labels = legend_labels) +
+  scale_shape_manual(values = shape_palette, labels = legend_labels) +
+  labs(
+    x = "Sampling Month",
+    y = "Relative Abundance (%)"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1),
+    legend.position  = "right",
+    legend.text      = ggtext::element_markdown(), # Renders Markdown italics in legend
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    legend.title     = element_blank()
+  ) +
+  force_panelsizes(
+    rows = unit(2, "in"), 
+    cols = unit(4, "in")
+  )
+
+# Display plot in console
+print(Alexandrium_seasonal)
+
+# ------------------------------------------------------------------------------
+# 2.5 Export Figure
+# ------------------------------------------------------------------------------
+ggsave("figures/Figure_4_Alexandrium.png", Alexandrium_seasonal, width = 10, height = 3, dpi = 300)
+```
+```{r Dinophysis species(complex) line plot}
+# Ensure output directory exists for exported figures
+dir.create("figures", showWarnings = FALSE, recursive = TRUE)
+
+# ==============================================================================
+# 1. SEQUENCE ALIGNMENT & TAXONOMIC MATCHING (PR2 DATABASE)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1.1 Subset Dinophysis ASVs and Reference Data
+# ------------------------------------------------------------------------------
+# Extract Dinophysis ASVs, reference sequences, and total read counts
+ps_dino   <- subset_taxa(ps_algae, Genus == "Dinophysis")
+asv_seqs  <- refseq(ps_dino)
+asv_reads <- taxa_sums(ps_dino)
+
+# Load PR2 reference database and filter for Dinophysis reference entries
+pr2      <- readDNAStringSet("pr2_v5.1.1_SSU_dada2.fasta.gz")
+pr2_dino <- pr2[str_detect(names(pr2), "Dinophysis")]
+
+# ------------------------------------------------------------------------------
+# 1.2 Pairwise Alignment against PR2 Reference Database
+# ------------------------------------------------------------------------------
+# Align each ASV to PR2 entries to calculate percent identity and extract top matches
+dino_aligned <- map_dfr(names(asv_seqs), function(id) {
+  # Perform global-local pairwise alignment and calculate percent identity (PID1)
+  pids    <- pid(pairwiseAlignment(pr2_dino, asv_seqs[[id]], type = "global-local"), type = "PID1")
+  max_pid <- max(pids)
+  
+  # Extract top-matching reference headers at maximum identity
+  top_headers   <- names(pr2_dino)[pids == max_pid]
+  clean_headers <- gsub(";\\s*$", "", top_headers)
+  top_species   <- unique(str_replace_all(sub(".*[;|]", "", clean_headers), "_", " "))
+  
+  data.frame(
+    OTU             = id,
+    `Read number`   = asv_reads[[id]],
+    Pct_Identity    = round(max_pid, 2),
+    `Top PR2 Match` = paste(top_species[top_species != ""], collapse = " / "),
+    check.names     = FALSE,
+    stringsAsFactors = FALSE
+  )
+})
+
+# ------------------------------------------------------------------------------
+# 1.3 Filter & Summarize Taxa Abundances
+# ------------------------------------------------------------------------------
+# Filter for 100% identity matches and minimum read count threshold (>= 10 reads)
+dino_summary <- dino_aligned %>%
+  filter(Pct_Identity == 100, `Read number` >= 10) %>%
+  group_by(`Top PR2 Match`) %>%
+  summarise(
+    `Read number` = sum(`Read number`),
+    .groups       = "drop"
+  ) %>%
+  arrange(desc(`Read number`))
+
+# Print summary table to console
+print(dino_summary)
+
+
+# ==============================================================================
+# 2. SEASONAL RELATIVE ABUNDANCE ANALYSIS & PLOTTING
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 2.1 Map High-Confidence Categories & Merge with Community Profiles
+# ------------------------------------------------------------------------------
+# Map OTUs with 100% PR2 identity and >= 10 reads to their assigned match category
+asv_categories <- dino_aligned %>%
+  filter(Pct_Identity == 100, `Read number` >= 10) %>%
+  mutate(Category = `Top PR2 Match`) %>%
+  dplyr::select(OTU, Category)
+
+# Convert community counts to relative abundance (%) and join category mappings
+ps_rel <- transform_sample_counts(ps_algae, function(x) x / sum(x) * 100)
+
+dino_data <- psmelt(ps_rel) %>%
+  inner_join(asv_categories, by = "OTU") %>%
+  group_by(Sample, month, Category) %>%
+  summarize(Abundance = sum(Abundance), .groups = "drop")
+
+# ------------------------------------------------------------------------------
+# 2.2 Rank & Filter Taxa Categories
+# ------------------------------------------------------------------------------
+# Retain all categories (no abundance cutoff) and rank by overall mean abundance
+category_order <- dino_data %>%
+  group_by(Category) %>%
+  summarize(Overall_Mean = mean(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(Overall_Mean)) %>%
+  pull(Category)
+
+month_order <- c("March", "April", "May", "June", 
+                 "July", "August", "September", "October")
+
+# Summarize monthly mean relative abundance and standard error (SE)
+plot_data_dino <- dino_data %>%
+  filter(Category %in% category_order) %>%
+  group_by(month, Category) %>%
+  summarize(
+    Mean_Abundance = mean(Abundance, na.rm = TRUE),
+    SE             = sd(Abundance, na.rm = TRUE) / sqrt(n()),
+    .groups        = "drop"
+  ) %>%
+  mutate(
+    month    = factor(month, levels = month_order),
+    Category = factor(Category, levels = category_order) # Controls legend ordering
+  )
+
+write.csv(plot_data_dino, "Analysis/Tables/all/Dinophysis_RelAbund.csv")
+
+# ------------------------------------------------------------------------------
+# 2.3 Aesthetic Styling & Markdown Legend Formatting
+# ------------------------------------------------------------------------------
+# Format legend labels using Markdown syntax for selective taxonomic italicization
+legend_labels <- category_order %>%
+  str_replace_all("\\bDinophysis\\b", "*Dinophysis*") %>%
+  str_replace_all("\\b([a-z]{3,})\\b", "*\\1*") %>%
+  str_replace_all("\\*sp\\*\\.", "sp.") %>%
+  str_replace_all("\\*sp\\*", "sp") %>%
+  str_replace_all("\\*complex\\*", "complex") %>%
+  str_replace_all("\\* \\*", " ")
+
+n_cats <- length(category_order)
+
+# High-contrast purple palette tailored for Dinophysis species dynamics
+high_contrast_purples <- c(
+  "#4B1259", # Deep Plum
+  "#7B1FA2", # Rich Medium Purple
+  "#AE278F", # Vibrant Magenta-Purple
+  "#D81B60", # Bright Berry / Rose
+  "#E57373"  # Soft Coral-Red
+)
+
+# Smoothly ramp or slice purple palette depending on total categories present
+purple_palette <- if (n_cats <= 6) {
+  high_contrast_purples[1:n_cats]
+} else {
+  colorRampPalette(high_contrast_purples)(n_cats)
+}
+
+shape_palette <- rep_len(c(16, 17, 15, 18, 25, 19, 8), n_cats)
+
+# ------------------------------------------------------------------------------
+# 2.4 Construct Seasonal Dynamics Line Plot
+# ------------------------------------------------------------------------------
+Dinophysis_seasonal <- ggplot(
+  plot_data_dino, 
+  aes(x = month, y = Mean_Abundance, group = Category, color = Category, fill = Category, shape = Category)
+) +
+  geom_ribbon(
+    aes(ymin = pmax(0, Mean_Abundance - SE), ymax = Mean_Abundance + SE), 
+    alpha = 0.20, 
+    color = NA
+  ) +
+  geom_line(linewidth = 0.6) +
+  geom_point(size = 2) +
+  scale_color_manual(values = purple_palette, labels = legend_labels) +
+  scale_fill_manual(values = purple_palette, labels = legend_labels) +
+  scale_shape_manual(values = shape_palette, labels = legend_labels) +
+  labs(
+    x = "Sampling Month",
+    y = "Relative Abundance (%)"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1),
+    legend.position  = "right",
+    legend.text      = ggtext::element_markdown(), # Renders Markdown italics in legend
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    legend.title     = element_blank()
+  ) +
+  force_panelsizes(
+    rows = unit(2, "in"), 
+    cols = unit(4, "in")
+  )
+
+# Display plot in console
+print(Dinophysis_seasonal)
+
+# ------------------------------------------------------------------------------
+# 2.5 Export Figure
+# ------------------------------------------------------------------------------
+ggsave("figures/Figure_4_Dinophysis.png", Dinophysis_seasonal, width = 10, height = 3, dpi = 300)
+```
+
+
+
+
+
+
+
+# Figure 5: Differntial Abundance & Heatmaps Top30 Algae, and HAB Taxa 
+```{r Algae: Run Aldex2}
+ps_algae_active <- subset_samples(ps_algae, type == "active")
+
+sample_data(ps_algae_active)$month <- factor(
+  sample_data(ps_algae_active)$month, 
+  levels = c("March", "April", "May", "June", 
+             "July", "August", "September", "October")
+)
+
+tax_df <- data.frame(tax_table(ps_algae_active), stringsAsFactors = FALSE)
+
+clean_taxon_label <- function(genus, species, family, order, class) {
+  if (!is.na(species) && species != "" && species != "NA") {
+    if (!is.na(genus) && grepl(genus, species, ignore.case = TRUE)) {
+      return(species)
+    } else if (!is.na(genus) && genus != "" && genus != "NA") {
+      return(paste(genus, species))
+    } else {
+      return(species)
+    }
+  }
+  if (!is.na(genus) && genus != "" && genus != "NA") return(paste0(genus, " sp."))
+  if (!is.na(family) && family != "" && family != "NA") return(paste0("Fam. ", family))
+  if (!is.na(order)  && order != ""  && order != "NA")  return(paste0("Ord. ", order))
+  if (!is.na(class)  && class != ""  && class != "NA")  return(paste0("Cls. ", class))
+  
+  return("Unclassified Algae")
+}
+
+lowest_rank <- mapply(
+  clean_taxon_label, 
+  tax_df$Genus, tax_df$Species, tax_df$Family, tax_df$Order, tax_df$Class
+)
+
+
+# ==============================================================================
+# STEP 2: GLOMERATION & RELAXED FILTERING (PROTECT BLOOM TAXA)
+# ==============================================================================
+
+counts_raw <- as(otu_table(ps_algae_active), "matrix")
+if (!taxa_are_rows(ps_algae_active)) counts_raw <- t(counts_raw)
+
+counts_species <- rowsum(counts_raw, group = lowest_rank)
+
+# Keep taxa present in at least 1 sample with >= 5 total reads
+keep_taxa <- rowSums(counts_species > 0) >= 1 & rowSums(counts_species) >= 5
+counts_species_filt <- counts_species[keep_taxa, ]
+
+months_vector <- as.character(sample_data(ps_algae_active)$month)
+
+
+# ==============================================================================
+# STEP 3: RUN ALDEx2 (CLR + KRUSKAL-WALLIS ANOVA)
+# ==============================================================================
+
+set.seed(123)
+clr_species <- aldex.clr(
+  reads = counts_species_filt, 
+  conds = months_vector, 
+  mc.samples = 128, 
+  denom = "all"
+)
+kw_species_res <- aldex.kw(clr_species, useMC = TRUE)
+
+# ==============================================================================
+# STEP 4: CALCULATE MONTHLY CLR MEANS
+# ==============================================================================
+
+mc_instances <- clr_species@analysisData
+
+clr_means <- sapply(mc_instances, function(sample_mc) {
+  rowMeans(sample_mc)
+})
+rownames(clr_means) <- rownames(counts_species_filt)
+
+target_months <- c("March", "April", "May", "June", "July", "August", "September", "October")
+
+monthly_clr_means <- sapply(target_months, function(m) {
+  rowMeans(clr_means[, months_vector == m, drop = FALSE])
+})
+
+```
+
+```{r Algae: Month Heatmap Top 30}
+# ==============================================================================
+# 1. RANK TOP 30 TAXA & SORT BY PEAK MONTH (WATERFALL ORDER)
+
+# Extract significant taxa
+sig_taxa <- rownames(kw_species_res)[kw_species_res$kw.eBH < 0.05]
+if (length(sig_taxa) == 0) sig_taxa <- rownames(kw_species_res)[kw_species_res$kw.ep < 0.05]
+if (length(sig_taxa) < 30) sig_taxa <- rownames(monthly_clr_means)
+
+heatmap_matrix <- monthly_clr_means[sig_taxa, , drop = FALSE]
+
+# Calculate max seasonal amplitude (ΔCLR) and filter top 30
+delta_clr <- apply(heatmap_matrix, 1, function(row) max(row) - min(row))
+top30_taxa <- names(sort(delta_clr, decreasing = TRUE))[1:min(30, length(delta_clr))]
+
+heatmap_matrix_top30 <- heatmap_matrix[top30_taxa, , drop = FALSE]
+
+# Row Z-score normalization
+heatmap_matrix_scaled <- t(scale(t(heatmap_matrix_top30)))
+heatmap_matrix_scaled[is.na(heatmap_matrix_scaled)] <- 0
+
+# Sort rows strictly by peak month timing (March -> October)
+peak_month_order  <- order(max.col(heatmap_matrix_scaled, ties.method = "first"))
+heatmap_waterfall <- heatmap_matrix_scaled[peak_month_order, , drop = FALSE]
+
+# Format row labels: replace underscores with spaces & keep "sp." un-italicized
+italic_labels <- as.expression(lapply(rownames(heatmap_waterfall), function(x) {
+  x_clean <- gsub("_", " ", x)
+  if (grepl(" sp\\.$", x_clean)) {
+    base_name <- gsub(" sp\\.$", "", x_clean)
+    bquote(italic(.(base_name)) ~ "sp.")
+  } else {
+    bquote(italic(.(x_clean)))
+  }
+}))
+
+# ==============================================================================
+# 2. RENDER WATERFALL HEATMAP
+
+heatmap_colors <- colorRampPalette(c("#2166AC", "#F7F7F7", "#B2182B"))(100)
+
+ph_algae <- pheatmap::pheatmap(
+  heatmap_waterfall,
+  cluster_cols = FALSE,               # Chronological month order
+  cluster_rows = FALSE,               # Disables cladogram for strict waterfall
+  labels_row   = italic_labels,       # Italicized taxon names (plain "sp.")
+  scale        = "none",              # Matrix pre-scaled by Z-score
+  color        = heatmap_colors,
+  border_color = "grey90",
+  cellwidth    = 22,
+  cellheight   = 13,
+  fontsize_row = 10,
+  fontsize_col = 10,
+  main         = expression("Top 30 Algae (" * Delta * "CLR)")
+)
+
+ggsave("figures/Algae_top30_heatmap.svg", ph_algae, height = 7, width = 7)
+```
+
+```{r HAB: Run Aldex2}
+# Extract all HAB taxa from the dataset (ps_HAB was made from the already rarefied algal subset)
+
+# ------------------------------------------------------------------------------
+# 1. Define Target HAB (Harmful Algal Bloom) Taxa
+# ------------------------------------------------------------------------------
+hab_include <- c(
+  "Alexandr", "Pseudo-nitz", "Pseudonitz", "Dinophysis", "Heterosigma", 
+  "Margalefidinium", "Chaetoceros", "Phaeocystis", "Gonyaul", "Phaeocystal", 
+  "Chaetocerotal", "Dinophysial", "Gymnodinial", "Peridinial", "Suessial"
+)
+hab_pattern <- paste(hab_include, collapse = "|")
+
+# ------------------------------------------------------------------------------
+# 2. Identify and Subset HAB ASVs
+# ------------------------------------------------------------------------------
+# Filter taxonomy matrix across all ranks for target HAB keywords
+tax_df <- as.data.frame(as(tax_table(ps_clean), "matrix"))
+hab_asvs <- tax_df %>%
+  filter(if_any(everything(), ~ grepl(hab_pattern, .x, ignore.case = TRUE))) %>%
+  rownames()
+
+# Subset rarefied phyloseq object to HAB taxa and remove zero-abundance samples
+ps_HAB_unrarefied <- prune_taxa(hab_asvs, ps_clean) %>%
+  prune_samples(sample_sums(.) > 0, .)
+
+
+ps_HAB_unrarefied_active <- subset_samples(ps_HAB_unrarefied, type == "active")
+
+sample_data(ps_HAB_unrarefied_active)$month <- factor(
+  sample_data(ps_HAB_unrarefied_active)$month, 
+  levels = c("March", "April", "May", "June", 
+             "July", "August", "September", "October")
+)
+
+tax_df <- data.frame(tax_table(ps_HAB_unrarefied_active), stringsAsFactors = FALSE)
+
+clean_taxon_label <- function(genus, species, family, order, class) {
+  if (!is.na(species) && species != "" && species != "NA") {
+    if (!is.na(genus) && grepl(genus, species, ignore.case = TRUE)) {
+      return(species)
+    } else if (!is.na(genus) && genus != "" && genus != "NA") {
+      return(paste(genus, species))
+    } else {
+      return(species)
+    }
+  }
+  if (!is.na(genus) && genus != "" && genus != "NA") return(paste0(genus, " sp."))
+  if (!is.na(family) && family != "" && family != "NA") return(paste0("Fam. ", family))
+  if (!is.na(order)  && order != ""  && order != "NA")  return(paste0("Ord. ", order))
+  if (!is.na(class)  && class != ""  && class != "NA")  return(paste0("Cls. ", class))
+  
+  return("Unclassified Algae")
+}
+
+lowest_rank <- mapply(
+  clean_taxon_label, 
+  tax_df$Genus, tax_df$Species, tax_df$Family, tax_df$Order, tax_df$Class
+)
+
+
+# ==============================================================================
+# STEP 2: GLOMERATION & RELAXED FILTERING (PROTECT BLOOM TAXA)
+# ==============================================================================
+
+counts_raw <- as(otu_table(ps_HAB_unrarefied_active), "matrix")
+if (!taxa_are_rows(ps_HAB_unrarefied_active)) counts_raw <- t(counts_raw)
+
+counts_species <- rowsum(counts_raw, group = lowest_rank)
+
+# Keep taxa present in at least 1 sample with >= 5 total reads
+keep_taxa <- rowSums(counts_species > 0) >= 1 & rowSums(counts_species) >= 5
+counts_species_filt <- counts_species[keep_taxa, ]
+
+months_vector <- as.character(sample_data(ps_HAB_unrarefied_active)$month)
+
+
+# ==============================================================================
+# STEP 3: RUN ALDEx2 (CLR + KRUSKAL-WALLIS ANOVA)
+# ==============================================================================
+set.seed(123)
+clr_species <- aldex.clr(
+  reads = counts_species_filt, 
+  conds = months_vector, 
+  mc.samples = 128, 
+  denom = "all"
+)
+kw_species_res <- aldex.kw(clr_species, useMC = TRUE)
+
+# ==============================================================================
+# STEP 4: CALCULATE MONTHLY CLR MEANS
+# ==============================================================================
+
+mc_instances <- clr_species@analysisData
+
+clr_means <- sapply(mc_instances, function(sample_mc) {
+  rowMeans(sample_mc)
+})
+rownames(clr_means) <- rownames(counts_species_filt)
+
+target_months <- c("March", "April", "May", "June", "July", "August", "September", "October")
+
+monthly_clr_means <- sapply(target_months, function(m) {
+  rowMeans(clr_means[, months_vector == m, drop = FALSE])
+})
+```
+
+```{r HAB: Month Heatmap}
+# ==============================================================================
+# HAB WATERFALL HEATMAP (GENUS/SPECIES ONLY + BOLD RED ALASKA HAB SPECIES)
+# Assumes `monthly_clr_means` already exists in environment
+# ==============================================================================
+
+hab_taxa <- grep(hab_pattern, rownames(monthly_clr_means), ignore.case = TRUE, value = TRUE)
+hab_taxa <- hab_taxa[!grepl("^(Fam\\.|Ord\\.|Cls\\.|Unclassified)", hab_taxa)]
+
+if (length(hab_taxa) == 0) {
+  stop("No Genus/Species level taxa matching HAB roots were found.")
+}
+
+heatmap_matrix_hab <- monthly_clr_means[hab_taxa, , drop = FALSE]
+
+# Z-score normalization
+heatmap_matrix_scaled <- t(scale(t(heatmap_matrix_hab)))
+heatmap_matrix_scaled[is.na(heatmap_matrix_scaled)] <- 0
+
+# Waterfall order by peak month timing (March -> October)
+peak_month_order  <- order(max.col(heatmap_matrix_scaled, ties.method = "first"))
+heatmap_waterfall <- heatmap_matrix_scaled[peak_month_order, , drop = FALSE]
+
+# Alaska-specific known HAB species list
+known_hab_species <- c(
+  "Alexandrium catenella", "Alexandrium fundyense", "Alexandrium tamarense",
+  "Pseudo-nitzschia australis", "Pseudo-nitzschia multiseries", 
+  "Pseudo-nitzschia seriata", "Pseudo-nitzschia pungens", "Pseudo-nitzschia delicatissima",
+  "Dinophysis acuminata", "Dinophysis acuta", "Dinophysis norvegica", "Dinophysis fortii",
+  "Heterosigma akashiwo", "Margalefidinium polykrikoides",
+  "Chaetoceros convolutus", "Chaetoceros concavicornis",
+  "Phaeocystis pouchetii"
+)
+
+row_names_clean <- gsub("_", " ", rownames(heatmap_waterfall))
+
+# 6. Assign RED color strictly to exact matches in known_hab_species
+label_colors <- ifelse(row_names_clean %in% known_hab_species, "red", "black")
+
+# Format labels: BOLD-ITALIC for known HAB species, standard ITALIC for others
+italic_labels <- as.expression(lapply(row_names_clean, function(x) {
+  is_known <- x %in% known_hab_species
+  
+  if (grepl(" sp\\.$", x)) {
+    base_name <- gsub(" sp\\.$", "", x)
+    if (is_known) {
+      bquote(bolditalic(.(base_name)) ~ "sp.")
+    } else {
+      bquote(italic(.(base_name)) ~ "sp.")
+    }
+  } else {
+    if (is_known) {
+      bquote(bolditalic(.(x)))
+    } else {
+      bquote(italic(.(x)))
+    }
+  }
+}))
+
+# 7. Render Waterfall Heatmap with Bold Red Text Injection
+heatmap_colors <- colorRampPalette(c("#2166AC", "#F7F7F7", "#B2182B"))(100)
+
+ph_hab <- pheatmap::pheatmap(
+  heatmap_waterfall,
+  cluster_cols = FALSE,               # Chronological month order
+  cluster_rows = FALSE,               # Disables cladogram for strict waterfall
+  labels_row   = italic_labels,       # Formatted taxon expressions
+  scale        = "none",              # Pre-scaled by Z-score
+  color        = heatmap_colors,
+  border_color = "grey90",
+  cellwidth    = 22,
+  cellheight   = 13,
+  fontsize_row = 10,
+  fontsize_col = 10,
+  main         = expression("Target HAB Taxa (" * Delta * "CLR)"),
+  silent       = TRUE
+)
+
+# Inject custom text colors into gtable
+row_names_idx <- which(ph_hab$gtable$layout$name == "row_names")
+ph_hab$gtable$grobs[[row_names_idx]]$gp$col <- label_colors
+
+# Render final plot
+grid::grid.newpage()
+grid::grid.draw(ph_hab$gtable)
+
+ggsave("figures/HAB_heatmap.svg", ph_hab, height = 8, width = 7)
+```
+
+```{r Sampling Method Stats}
+# 1. Extract HAB genera directly from ps_HAB
+hab_genera <- unique(na.omit(as.character(tax_table(ps_HAB)[, "Genus"])))
+hab_genera <- hab_genera[hab_genera != ""]
+
+# 2. Aggregate full algal dataset to Genus level
+ps_genus <- tax_glom(ps_algae, taxrank = "Genus", NArm = TRUE)
+
+# 3. Extract count matrix and sampling conditions
+counts <- as.matrix(otu_table(ps_genus))
+if (!taxa_are_rows(ps_genus)) counts <- t(counts)
+
+sample_data(ps_algae)$type <- factor(sample_data(ps_algae)$type, levels = c("active", "passive"))
+conditions <- as.character(sample_data(ps_genus)$type)
+
+# 4. Run ALDEx2
+aldex_out <- aldex(counts, conditions, mc.samples = 128, test = "t", effect = TRUE, verbose = FALSE)
+
+# 5. Build results table
+tax_df <- as.data.frame(as(tax_table(ps_genus), "matrix"))
+
+aldex_algae <- aldex_out %>%
+  mutate(ASV_ID = rownames(.)) %>%
+  left_join(tax_df %>% mutate(ASV_ID = rownames(.)), by = "ASV_ID") %>%
+  mutate(
+    Enriched_In = ifelse(effect > 0, "passive", "active"),
+    Is_HAB      = Genus %in% hab_genera
+  ) %>%
+  dplyr::select(Genus, Class, diff.btw, effect, wi.ep, wi.eBH, we.ep, we.eBH, Enriched_In, Is_HAB) %>%
+  arrange(wi.eBH)
+
+# 6. Filter significant results
+sig_algae <- aldex_algae %>% filter(wi.eBH < 0.05)
+sig_algae
+
+write.csv(sig_algae,"statistics/Algae_Aldex2.csv")
+```
+
+
+##### Supplemental Figures #####
+# Figure S1: Rarefaction Curve
+```{r Algae Rarefaction Curve}
+# ------------------------------------------------------------------------------
+# Algal Rarefaction Curve
+# ------------------------------------------------------------------------------
+# Ensure output directory exists
+dir.create("figures", showWarnings = FALSE, recursive = TRUE)
+
+# Export high-resolution rarefaction plot
+png("figures/Algal_Rarefaction_Curve.png", width = 3400, height = 1800, res = 300)
+
+otu_tab_algae <- as(otu_table(ps_algae), "matrix")
+if (taxa_are_rows(ps_algae)) { otu_tab_algae <- t(otu_tab_algae) }
+
+rarecurve(
+  otu_tab_algae, 
+  step = 50, 
+  col = "blue", 
+  label = FALSE, 
+  main = "Algal Rarefaction Curve",
+  xlab = "Read Count",
+  ylab = "No. ASVs",
+  xlim = c(0, 10000)
+)
+abline(v = 2603, col = "red", lty = 2) # Depth threshold line (2,603 reads)
+dev.off()
+```
+
+
+
+# Figure S3: Differntial Abundance & Heatmaps for all Algal Taxa
+```{r Algae: Month Differential abundance: Aldex2 + Heatmap}
+ps_algae_active <- subset_samples(ps_algae, type == "active")
+
+sample_data(ps_algae_active)$month <- factor(
+  sample_data(ps_algae_active)$month, 
+  levels = c("March", "April", "May", "June", 
+             "July", "August", "September", "October")
+)
+
+tax_df <- data.frame(tax_table(ps_algae_active), stringsAsFactors = FALSE)
+
+# ------------------------------------------------------------------------------
+# 1. Label Function: Strict Genus / Genus+Species Level Only
+# ------------------------------------------------------------------------------
+clean_taxon_label <- function(genus, species) {
+  if (is.na(genus) || genus == "" || genus == "NA") return(NA_character_)
+  
+  if (!is.na(species) && species != "" && species != "NA") {
+    if (grepl(genus, species, ignore.case = TRUE)) {
+      return(species)
+    } else {
+      return(paste(genus, species))
+    }
+  }
+  return(paste0(genus, " sp."))
+}
+
+lowest_rank <- mapply(clean_taxon_label, tax_df$Genus, tax_df$Species)
+
+# ------------------------------------------------------------------------------
+# 2. Subset Phyloseq to Valid Genus/Species ASVs Only
+# ------------------------------------------------------------------------------
+valid_asvs <- !is.na(lowest_rank)
+ps_algae_genus_level <- prune_taxa(valid_asvs, ps_algae_active)
+
+counts_raw  <- as(otu_table(ps_algae_genus_level), "matrix")
+if (!taxa_are_rows(ps_algae_genus_level)) counts_raw <- t(counts_raw)
+
+# Group strictly by valid genus / genus+species labels
+valid_labels   <- lowest_rank[valid_asvs]
+counts_species <- rowsum(counts_raw, group = valid_labels)
+
+# Keep taxa present in at least 1 sample with >= 5 total reads
+keep_taxa           <- rowSums(counts_species > 0) >= 1 & rowSums(counts_species) >= 5
+counts_species_filt <- counts_species[keep_taxa, ]
+
+months_vector <- as.character(sample_data(ps_algae_genus_level)$month)
+
+# ------------------------------------------------------------------------------
+# 3. Run ALDEx2 (CLR + Kruskal-Wallis ANOVA)
+# ------------------------------------------------------------------------------
+set.seed(123)
+clr_species <- aldex.clr(
+  reads      = counts_species_filt, 
+  conds      = months_vector, 
+  mc.samples = 128, 
+  denom      = "all"
+)
+
+kw_species_res <- aldex.kw(clr_species, useMC = TRUE)
+
+# ------------------------------------------------------------------------------
+# 4. Calculate Monthly CLR Means
+# ------------------------------------------------------------------------------
+mc_instances <- clr_species@analysisData
+
+clr_means <- sapply(mc_instances, function(sample_mc) {
+  rowMeans(sample_mc)
+})
+rownames(clr_means) <- rownames(counts_species_filt)
+
+target_months <- c("March", "April", "May", "June", "July", "August", "September", "October")
+
+monthly_clr_means <- sapply(target_months, function(m) {
+  rowMeans(clr_means[, months_vector == m, drop = FALSE])
+})
+
+# ------------------------------------------------------------------------------
+# 5. Filter Significant Taxa & Build Waterfall Heatmap
+# ------------------------------------------------------------------------------
+sig_taxa <- rownames(kw_species_res)[kw_species_res$kw.eBH < 0.05]
+
+if (length(sig_taxa) == 0) {
+  warning("No taxa passed kw.eBH < 0.05. Subsetting using unadjusted p-value (kw.ep < 0.05).")
+  sig_taxa <- rownames(kw_species_res)[kw_species_res$kw.ep < 0.05]
+}
+
+heatmap_matrix_sig <- monthly_clr_means[sig_taxa, , drop = FALSE]
+
+# Row Z-score normalization
+heatmap_matrix_scaled <- t(scale(t(heatmap_matrix_sig)))
+heatmap_matrix_scaled[is.na(heatmap_matrix_scaled)] <- 0
+
+# Sort rows strictly by peak month timing (March -> October)
+peak_month_order  <- order(max.col(heatmap_matrix_scaled, ties.method = "first"))
+heatmap_waterfall <- heatmap_matrix_scaled[peak_month_order, , drop = FALSE]
+
+# Format row labels: replace underscores with spaces & keep "sp." un-italicized
+italic_labels <- as.expression(lapply(rownames(heatmap_waterfall), function(x) {
+  x_clean <- gsub("_", " ", x)
+  if (grepl(" sp\\.$", x_clean)) {
+    base_name <- gsub(" sp\\.$", "", x_clean)
+    bquote(italic(.(base_name)) ~ "sp.")
+  } else {
+    bquote(italic(.(x_clean)))
+  }
+}))
+
+heatmap_colors <- colorRampPalette(c("#2166AC", "#F7F7F7", "#B2182B"))(100)
+
+ph_algae_all <- pheatmap::pheatmap(
+  heatmap_waterfall,
+  cluster_cols = FALSE,
+  cluster_rows = FALSE,
+  labels_row   = italic_labels,
+  scale        = "none",
+  color        = heatmap_colors,
+  border_color = "grey90",
+  cellwidth    = 22,
+  cellheight   = 9,
+  fontsize_row = 9,
+  fontsize_col = 10,
+  main         = expression("All Algae (" * Delta * "CLR)")
+)
+
+ggsave("figures/Algae_heatmap_all.svg", ph_algae_all, height = 20, width = 7)
+```
+
+
+# Figure S4: Relative Taxon Abundance: Sampling method
+```{r Algae: Class-level Relative Abundance Plot: Sampling Method}
+threshold <- 0.01 
+
+# 1. Subset for July and August across BOTH sampling methods (active & passive)
+ps_sub <- subset_samples(ps_algae_rarefied, month %in% c("July", "August"))
+
+# 2. Convert counts to relative abundance per sample
+ps_rel_algae <- transform_sample_counts(ps_sub, function(x) x / sum(x))
+
+# 3. Agglomerate to Class level
+ps_class_algae <- tax_glom(ps_rel_algae, taxrank = "Class", NArm = FALSE)
+
+# 4. Convert phyloseq object to long dataframe
+df_long_algae <- psmelt(ps_class_algae)
+
+# 5. Process data at the individual sample level
+class_means <- df_long_algae %>%
+  mutate(
+    Class = case_when(
+      is.na(Class) | str_trim(Class) == "" | Class == "NA" ~ "Other",
+      TRUE ~ Class
+    )
+  ) %>%
+  group_by(Class) %>%
+  summarise(mean_abund = mean(Abundance), .groups = "drop")
+
+major_classes <- class_means %>%
+  filter(mean_abund >= threshold & Class != "Other") %>%
+  pull(Class)
+
+plot_data_algae <- df_long_algae %>%
+  mutate(
+    Class = case_when(
+      is.na(Class) | str_trim(Class) == "" | Class == "NA" ~ "Other",
+      TRUE ~ Class
+    ),
+    Class_collapsed = if_else(Class %in% major_classes, Class, "Other"),
+    month = factor(month, levels = c("July", "August")),
+    type  = factor(str_to_title(type), levels = c("Active", "Passive"))
+  ) %>%
+  group_by(Sample, month, type, Class_collapsed) %>%
+  summarise(Abundance = sum(Abundance), .groups = "drop")
+
+unique_classes_algae <- sort(unique(plot_data_algae$Class_collapsed))
+legend_order_algae   <- c("Other", setdiff(unique_classes_algae, "Other"))
+
+# Strict colorblind-friendly palette (Okabe-Ito / Tol qualitative mix)
+Class_colors <- c(
+  "Other"                       = "#888888", # Neutral Grey
+  "Cryptophyceae"               = "#56B4E9", # Sky Blue
+  "Dinophyceae"                 = "#E69F00", # Warm Amber / Gold
+  "Mamiellophyceae"             = "#009E73", # Teal Green
+  "Mediophyceae"                = "#0072B2", # Strong Blue
+  "Prymnesiophyceae"            = "#D55E00", # Vermilion / Rust
+  "Syndiniales"                 = "#CC79A7", # Reddish Purple / Magenta
+  "Ulvophyceae"                 = "#F0E442", # Bright Yellow
+  "Bacillariophyceae"           = "#661100", # Dark Chestnut Brown
+  "Chrysophyceae"               = "#AA4499", # Bright Purple
+  "Picomonadea"                 = "#66CCEE", # High-contrast Ice Blue
+  "Picozoa_XX"                  = "#332299", # Deep Navy
+  "Prymbesiophyceae"            = "#882255",
+  "Sagenista"                   = "#999933",
+  "Peronosporomycetes"          = "#117733",
+  "Opalozoa"                    = "#DDCC77"  # Pale Sand / Ochre
+)
+
+# 6. Plot stacked bar chart with merged top facet headers via ggh4x::facet_nested
+algae_Class_Type <- ggplot(
+  plot_data_algae, 
+  aes(x = Sample, y = Abundance, fill = factor(Class_collapsed, levels = legend_order_algae))
+) +
+  geom_col(position = position_stack(reverse = FALSE), width = 0.8, color = "black", linewidth = 0.2) +
+  ggh4x::facet_nested(~ month + type, scales = "free_x", space = "free_x") +
+  scale_y_continuous(labels = scales::percent, expand = c(0, 0)) +
+  scale_fill_manual(values = Class_colors, name = "Class") +
+  labs(
+    x = "Sample",
+    y = "Relative Abundance",
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    text = element_text(color = "black"),
+    axis.title.x = element_text(color = "black", size = 11),
+    axis.title.y = element_text(color = "black", size = 11),
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, color = "black", size = 9),
+    axis.text.y = element_text(color = "black", size = 10),
+    legend.title = element_text(color = "black", face = "bold", size = 11),
+    legend.text = element_text(color = "black", size = 10),
+    strip.background = element_rect(fill = "grey90", color = "black"),
+    strip.text = element_text(size = 10),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8)
+  )
+
+algae_Class_Type
+
+ggsave("figures/Algae_Class_Type.svg", algae_Class_Type, height = 5, width =7)
+```
+
+```{r HAB: Sampling method Stacked Bar}
+threshold <- 0.01 
+
+# 1. Subset for July and August across BOTH sampling methods (active & passive)
+ps_sub_HAB <- subset_samples(ps_HAB, month %in% c("July", "August"))
+
+# 2. Convert counts to relative abundance (0 to 1) per sample
+ps_rel_HAB <- transform_sample_counts(ps_sub_HAB, function(x) x / sum(x))
+
+# 3. Agglomerate to Genus level
+ps_Genus <- tax_glom(ps_rel_HAB, taxrank = "Genus", NArm = FALSE)
+
+# 4. Convert phyloseq object to long dataframe
+df_long_HAB <- psmelt(ps_Genus)
+
+# 5. Process data at individual sample level
+genus_means <- df_long_HAB %>%
+  mutate(
+    Genus = case_when(
+      is.na(Genus) | str_trim(Genus) == "" | Genus == "NA" ~ "Other",
+      TRUE ~ Genus
+    )
+  ) %>%
+  group_by(Genus) %>%
+  summarise(mean_abund = mean(Abundance), .groups = "drop")
+
+major_genera <- genus_means %>%
+  filter(mean_abund >= threshold & Genus != "Other") %>%
+  pull(Genus)
+
+plot_data_HAB <- df_long_HAB %>%
+  mutate(
+    Genus = case_when(
+      is.na(Genus) | str_trim(Genus) == "" | Genus == "NA" ~ "Other",
+      TRUE ~ Genus
+    ),
+    Genus_collapsed = if_else(Genus %in% major_genera, Genus, "Other"),
+    month = factor(month, levels = c("July", "August")),
+    type  = factor(str_to_title(type), levels = c("Active", "Passive"))
+  ) %>%
+  group_by(Sample, month, type, Genus_collapsed) %>%
+  summarise(Abundance = sum(Abundance), .groups = "drop")
+
+# --- Set Up High-Contrast Multi-Hue Palette ---
+unique_Genus <- sort(unique(plot_data_HAB$Genus_collapsed))
+legend_order <- c("Other", setdiff(unique_Genus, "Other"))
+num_genera   <- length(setdiff(legend_order, "Other"))
+
+# Distinct, high-contrast palette alternating warm, cool, and rich tones (eliminating blue clustering)
+distinct_palette <- c(
+  "#D55E00", # Vermillion / Red-Orange
+  "#0072B2", # Deep Blue
+  "#E69F00", # Amber / Orange
+  "#009E73", # Emerald Green
+  "#CC79A7", # Reddish Purple / Magenta
+  "#F0E442", # Bright Yellow
+  "#882255", # Dark Wine / Plum
+  "#117733", # Forest Green
+  "#88CCEE"  # Light Cyan
+)
+
+if (num_genera <= length(distinct_palette)) {
+  base_colors <- distinct_palette[1:num_genera]
+} else {
+  base_colors <- colorRampPalette(distinct_palette)(num_genera)
+}
+
+# Neutral dark grey for "Other" + distinct hues for genera
+my_colors <- setNames(c("#777777", base_colors), legend_order)
+
+# Format legend labels: plain text for "Other", italicized for actual genus names
+legend_labels <- parse(text = ifelse(legend_order == "Other", "'Other'", paste0("italic('", legend_order, "')")))
+
+# 6. Plot stacked bar chart
+HAB_Genus_type <- ggplot(
+  plot_data_HAB, 
+  aes(x = Sample, y = Abundance, fill = factor(Genus_collapsed, levels = legend_order))
+) +
+  geom_col(position = position_stack(reverse = FALSE), width = 0.8, color = "black", linewidth = 0.2) +
+  ggh4x::facet_nested(~ month + type, scales = "free_x", space = "free_x") +
+  scale_y_continuous(labels = scales::percent, expand = c(0, 0)) +
+  scale_fill_manual(values = my_colors, name = "Genus", labels = legend_labels) +
+  labs(
+    x = "Sample",
+    y = "Relative Abundance",
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    text = element_text(color = "black"),
+    axis.title.x = element_text(color = "black", size = 11),
+    axis.title.y = element_text(color = "black", size = 11),
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, color = "black", size = 9),
+    axis.text.y = element_text(color = "black", size = 10),
+    legend.title = element_text(color = "black", face = "bold", size = 11),
+    legend.text = element_text(color = "black", size = 10),
+    strip.background = element_rect(fill = "grey90", color = "black"),
+    strip.text = element_text(size = 10),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8)
+  )
+
+HAB_Genus_type
+
+ggsave("figures/HAB_Genus_type.svg", HAB_Genus_type, height = 5, width = 7)
+
+```
+
