@@ -9,14 +9,14 @@
 # ------------------------------------------------------------------------------
 # SLURM Resource Allocation Directives
 # ------------------------------------------------------------------------------
-#SBATCH --job-name=18SV4-5_qiime
-#SBATCH --partition=analysis
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
-#SBATCH --mem=128G
-#SBATCH --time=48:00:00
-#SBATCH --output=18SV4-5_qiime_%j.out
-#SBATCH --error=18SV4-5_qiime_%j.err
+SBATCH --job-name=18SV4-5_qiime
+SBATCH --partition=analysis
+SBATCH --ntasks=1
+SBATCH --cpus-per-task=12
+SBATCH --mem=128G
+SBATCH --time=48:00:00
+SBATCH --output=18SV4-5_qiime_%j.out
+SBATCH --error=18SV4-5_qiime_%j.err
 
 # Exit immediately if any command fails
 set -e
@@ -65,8 +65,8 @@ qiime tools import \
 # Trim 18S V4-V5 specific forward and reverse primer sequences
 qiime cutadapt trim-paired \
   --i-demultiplexed-sequences "$OUTPUT_DIR/paired-end-demux.qza" \
-  --p-front-f "AAAAAGCTTCCATCCAACATCTCAGCATGATGAAA" \
-  --p-front-r "AAACTGCAGCCCCTCAGAATGATATTTGTCCTCA" \
+  --p-front-f "CCAGCASCYGCGGTAATTCC" \
+  --p-front-r "ACTTTCGTTCTTGATYRA" \
   --p-cores "$N_THREADS" \
   --o-trimmed-sequences "$OUTPUT_DIR/trimmed-demux.qza"
 
